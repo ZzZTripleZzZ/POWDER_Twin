@@ -662,9 +662,13 @@ int main( int argc, char **argv ) {
   // METAL VERSIONS //
   // fpr = fopen("../../../channel/real_random_10tap.txt", "r");
   // fpi = fopen("../../../channel/real_random_10tap.txt", "r");
+  const char *cir_path_real = getenv("TT_CHANNEL_FILE_REAL");
+  if (!cir_path_real) cir_path_real = "../../../channel/channel_clean.txt";
+  const char *cir_path_imag = getenv("TT_CHANNEL_FILE_IMAG");
+  if (!cir_path_imag) cir_path_imag = "../../../channel/channel_clean.txt";
   for (int i=0;i<50;i++){
-    fpr[i] = fopen("../../../channel/channel_clean.txt", "r");
-    fpi[i] = fopen("../../../channel/channel_clean.txt", "r");
+    fpr[i] = fopen(cir_path_real, "r");
+    fpi[i] = fopen(cir_path_imag, "r");
   }
   // fplog = fopen("../../../logs/timing.txt", "w"); // file the data from the timing array is written to
   // fplog2 = fopen("../../../logs/mac.txt", "w"); // when did a TTI start 
