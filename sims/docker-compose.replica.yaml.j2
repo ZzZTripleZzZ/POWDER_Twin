@@ -1,0 +1,94 @@
+{# Jinja2 template — rendered by policy_arbiter.py for each twin replica #}
+{#                                                                          #}
+{# Variables:                                                               #}
+{#   replica_id    (int)  — 0-based index                                   #}
+{#   cir_real_path (str)  — host path to perturbed CIR real file            #}
+{#   cir_imag_path (str)  — host path to perturbed CIR imag file            #}
+{#   port_base     (int)  — host port for metrics PUB (= 5555 + id*100)     #}
+{#                                                                          #}
+{# Network design:                                                          #}
+{#   tt-public-net  — shared with oai-cn so gNB can register with AMF      #}
+{#   replica_net_N  — isolated per-replica network for gNB↔UE RFsim only   #}
+{#                                                                          #}
+{# PREREQUISITE: oai-cn must be running on tt-public-net before starting   #}
+{# replicas. Start it with:                                                  #}
+{#   cd ~/Tiny_Twin/sims/oai-cn                                            #}
+{#   docker compose -f docker-compose.yaml \                               #}
+{#                  -f ~/dt_sync/sims/oai-cn-tt-override.yaml up -d        #}
+
+services:
+
+  tt-gnb-r{{ replica_id }}:
+    image: tt-gnb:v2
+    container_name: tt-gnb-r{{ replica_id }}
+    privileged: true
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      - TT_CHANNEL_FILE_REAL={{ cir_real_path }}
+      - TT_CHANNEL_FILE_IMAG={{ cir_imag_path }}
+    volumes:
+      - ~/Tiny_Twin:/opt/tt-ran/tt:rw
+      - /tmp:/tmp:rw
+    ports:
+      - "{{ port_base }}:5555"       # metrics PUB  (host → orchestrator)
+      - "{{ port_base + 1 }}:5556"   # weights SUB  (orchestrator → gNB)
+      - "{{ port_base + 2 }}:5557"   # mcs SUB
+    entrypoint: >
+      /bin/bash -c "
+        cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&
+        TT_CHANNEL_FILE_REAL=$TT_CHANNEL_FILE_REAL
+        TT_CHANNEL_FILE_IMAG=$TT_CHANNEL_FILE_IMAG
+        ./nr-softmodem
+          -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+          --rfsim -E --sa
+          --rfsimulator.options chanmod
+          --TAP 1 --TTI 1 --SNR 1 &&
+        exec /bin/bash"
+    stdin_open: true
+    tty: true
+    networks:
+      # Access shared CN (AMF at 192.168.70.132 on this network)
+      public_net:
+        ipv4_address: 192.168.70.{{ 140 + replica_id }}
+      # Isolated RFsim network for gNB↔UE only
+      replica_net_{{ replica_id }}:
+        ipv4_address: 10.{{ 70 + replica_id }}.0.140
+
+  tt-nrue-r{{ replica_id }}:
+    image: tt-nrue:v2
+    container_name: tt-ue-r{{ replica_id }}
+    privileged: true
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    volumes:
+      - ~/Tiny_Twin:/opt/tt-ran/tt:rw
+    entrypoint: >
+      /bin/bash -c "
+        cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&
+        ./nr-uesoftmodem
+          --uicc0.imsi 00101000000000{{ '%d' % (replica_id + 1) }}
+          -C 3619200000 -r 106 --numerology 1 --ssb 516
+          -E --sa --rfsim --rfsimulator.options chanmod --TAP 1
+          -O ../../../ci-scripts/conf_files/nrue.uicc.conf
+          --rfsimulator.serveraddr 10.{{ 70 + replica_id }}.0.140 &&
+        exec /bin/bash"
+    stdin_open: true
+    tty: true
+    depends_on:
+      - tt-gnb-r{{ replica_id }}
+    networks:
+      replica_net_{{ replica_id }}:
+        ipv4_address: 10.{{ 70 + replica_id }}.0.150
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+networks:
+  public_net:
+    external: true
+    name: tt-public-net   # shared network where oai-cn lives
+  replica_net_{{ replica_id }}:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.{{ 70 + replica_id }}.0.128/26
