@@ -1,10 +1,10 @@
 # Drop-in override: makes oai-cn join the pre-existing tt-public-net
-# instead of creating its own oai-cn5g-public-net.
+# instead of creating its own oai-cn5g-public-net on the same subnet.
 #
-# Usage:
-#   cd ~/Tiny_Twin/sims/oai-cn
-#   docker compose -f docker-compose.yaml \
-#                  -f ~/dt_sync/sims/oai-cn-tt-override.yaml up -d
+# Usage (from ~/Tiny_Twin/sims/oai-cn):
+#   sudo docker compose -f docker-compose.yaml \
+#                       -f oai-cn-tt-override.yaml up -d
+
 networks:
   public_net:
     external: true

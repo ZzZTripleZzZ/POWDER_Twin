@@ -2,27 +2,31 @@
 # Supports three modes via TT_CHANNEL_FILE_REAL / TT_CHANNEL_FILE_IMAG env vars:
 #
 #   Phase B  (static, default):
-#     docker compose -f docker-compose.twin.yaml up -d tt-gnb tt-nrue1
+#     cd ~/Tiny_Twin/sims
+#     sudo docker compose -f docker-compose.twin.yaml up -d tt-gnb
+#     sleep 5
+#     sudo docker compose -f docker-compose.twin.yaml up -d tt-nrue1
 #
 #   Phase B2 (dynamic CIR file):
-#     TT_CHANNEL_FILE_REAL=../Tiny_Twin/channel/channel_gradual.txt \
-#     TT_CHANNEL_FILE_IMAG=../Tiny_Twin/channel/channel_gradual.txt \
-#     docker compose -f docker-compose.twin.yaml up -d tt-gnb tt-nrue1
+#     export TT_CHANNEL_FILE_REAL=/tt-ran/channel/channel_gradual.txt
+#     export TT_CHANNEL_FILE_IMAG=/tt-ran/channel/channel_gradual.txt
+#     sudo -E docker compose -f docker-compose.twin.yaml up -d tt-gnb; sleep 5; ...
 #
 #   Phase C2 (named pipe — real-time sync from state_sync.py):
 #     mkfifo /tmp/tt_cir_real.fifo /tmp/tt_cir_imag.fifo
-#     TT_CHANNEL_FILE_REAL=/tmp/tt_cir_real.fifo \
-#     TT_CHANNEL_FILE_IMAG=/tmp/tt_cir_imag.fifo \
-#     docker compose -f docker-compose.twin.yaml up -d tt-gnb tt-nrue1
+#     export TT_CHANNEL_FILE_REAL=/tmp/tt_cir_real.fifo
+#     export TT_CHANNEL_FILE_IMAG=/tmp/tt_cir_imag.fifo
+#     sudo -E docker compose -f docker-compose.twin.yaml up -d tt-gnb tt-nrue1
 #
-# Prerequisite: docker network create --driver bridge \
-#   --subnet 192.168.70.128/26 tt-public-net
+# Prerequisite: docker network tt-public-net exists (created by profile_twin.py startup).
+# Start CN first: cd ~/Tiny_Twin/sims/oai-cn
+#   sudo docker compose -f docker-compose.yaml -f oai-cn-tt-override.yaml up -d
+#
+# NOTE: binaries run from inside the container image (no host-compiled OAI needed).
+#   gNB binary: /tt-ran/cmake_targets/ran_build/build/nr-softmodem   (tt-gnb:v2)
+#   UE  binary: /opt/tt-ran/cmake_targets/ran_build/build/nr-uesoftmodem  (tt-nrue:v2)
 
 services:
-  # NOTE: oai-cn is NOT managed here — start it separately before this compose:
-  #   cd ~/Tiny_Twin/sims/oai-cn && docker compose up -d
-  #   (wait until mysql, oai-amf, oai-smf, oai-upf, oai-ext-dn are healthy)
-
   # ── gNB (Twin) ──────────────────────────────────────────────────────────────
   tt-gnb:
     image: tt-gnb:v2
@@ -35,17 +39,15 @@ services:
       - NET_RAW
     environment:
       # CIR file paths — override at runtime for B2 (file) or C2 (named pipe)
-      - TT_CHANNEL_FILE_REAL=${TT_CHANNEL_FILE_REAL:-/opt/tt-ran/tt/channel/channel_clean.txt}
-      - TT_CHANNEL_FILE_IMAG=${TT_CHANNEL_FILE_IMAG:-/opt/tt-ran/tt/channel/channel_clean.txt}
+      - TT_CHANNEL_FILE_REAL=${TT_CHANNEL_FILE_REAL:-/tt-ran/channel/channel_clean.txt}
+      - TT_CHANNEL_FILE_IMAG=${TT_CHANNEL_FILE_IMAG:-/tt-ran/channel/channel_clean.txt}
     volumes:
-      - ../Tiny_Twin:/opt/tt-ran/tt:rw
-      # Named pipe support: mount /tmp from host so pipes are accessible
-      - /tmp:/tmp:rw
+      - ../logs:/tt-ran/logs        # expose gNB logs to host
+      - /tmp:/tmp:rw                # named pipe support for Phase C2
     entrypoint: >
       /bin/bash -c "
-        cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&
-        TT_CHANNEL_FILE_REAL=$TT_CHANNEL_FILE_REAL \
-        TT_CHANNEL_FILE_IMAG=$TT_CHANNEL_FILE_IMAG \
+        mkdir -p /tt-ran/logs &&
+        cd /tt-ran/cmake_targets/ran_build/build/ &&
         ./nr-softmodem \
           -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
           --rfsim -E --sa \
@@ -68,11 +70,9 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    volumes:
-      - ../Tiny_Twin:/opt/tt-ran/tt:rw
     entrypoint: >
       /bin/bash -c "
-        cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&
+        cd /opt/tt-ran/cmake_targets/ran_build/build/ &&
         ./nr-uesoftmodem \
           --uicc0.imsi 001010000000001 \
           -C 3619200000 -r 106 --numerology 1 --ssb 516 \
@@ -102,11 +102,9 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    volumes:
-      - ../Tiny_Twin:/opt/tt-ran/tt:rw
     entrypoint: >
       /bin/bash -c "
-        cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&
+        cd /opt/tt-ran/cmake_targets/ran_build/build/ &&
         ./nr-uesoftmodem \
           --uicc0.imsi 001010000000002 \
           -C 3619200000 -r 106 --numerology 1 --ssb 516 \
@@ -136,11 +134,9 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
-    volumes:
-      - ../Tiny_Twin:/opt/tt-ran/tt:rw
     entrypoint: >
       /bin/bash -c "
-        cd /opt/tt-ran/tt/cmake_targets/ran_build/build/ &&
+        cd /opt/tt-ran/cmake_targets/ran_build/build/ &&
         ./nr-uesoftmodem \
           --uicc0.imsi 001010000000003 \
           -C 3619200000 -r 106 --numerology 1 --ssb 516 \
