@@ -55,6 +55,9 @@ services:
         --rfsim -E --sa
         --rfsimulator.options chanmod
         --TAP 1 --TTI 1 --SNR 1 --CQI 1 --TPT 1
+    ports:
+      - "5555:5555"   # EdgeRIC metrics ZMQ PUB — accessible from host/Mac
+      - "5560:5560"   # MacReconciler ZMQ REP (M4 equivalence)
     stdin_open: true
     tty: true
     networks:
