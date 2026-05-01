@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+// M4 — Reconciliation protocol for provable MAC-state equivalence.
+// Twin orchestrator (client) REQs every K TTIs; real-side server (REP) responds.
+
+message ReconciliationRequest {
+    uint64 twin_tti_seq    = 1;   // twin orchestrator's last received tti_seq
+    bytes  twin_global_hash = 2;  // twin orchestrator's last computed global_state_hash
+    uint32 reconcile_epoch = 3;   // twin's current epoch counter
+    uint64 wall_clock_us   = 4;   // for empirical RTT measurement
+}
+
+// UeState mirrors UeMetrics fields used in hash (avoids proto import dependency)
+message UeState {
+    uint32          rnti               = 1;
+    uint32          cqi                = 2;
+    repeated uint32 harq_state         = 3;
+    uint32          scheduler_queue_age = 4;
+    uint32          bsr_kbytes         = 5;
+    bytes           ue_state_hash      = 6;
+}
+
+message ReconciliationResponse {
+    uint64          real_tti_seq    = 1;
+    repeated UeState full_state     = 2;  // non-empty only when hash_matched=false
+    bytes           real_global_hash = 3;
+    bool            hash_matched    = 4;  // true → twin already in sync, no diff needed
+    uint32          reconcile_epoch = 5;
+    uint64          wall_clock_us   = 6;  // real-side timestamp for RTT calc
+}

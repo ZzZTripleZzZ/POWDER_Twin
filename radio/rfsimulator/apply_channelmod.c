@@ -24,6 +24,8 @@
 
 #include <time.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <complex.h>
 #include <common/utils/LOG/log.h>
 #include <openair1/SIMULATION/TOOLS/sim.h>
@@ -31,6 +33,53 @@
 //////
 #include <stdio.h>
 #include <omp.h>
+
+/* ── M3: Selective-Fidelity Mode ─────────────────────────────────────────── *
+ * Controlled by TT_FIDELITY_MODE env var (read once at first call):
+ *   unset / "full_iq"   → original 100-tap CIR convolution (default)
+ *   "sparse_tap"        → top-K taps only; K from TT_SPARSE_K (default 4)
+ *   "mac_only"          → skip CIR reads and convolution entirely
+ * ─────────────────────────────────────────────────────────────────────────── */
+#define TT_MAX_K 20
+
+static enum tt_fidelity_mode {
+    TT_MODE_FULL_IQ    = 0,
+    TT_MODE_SPARSE_TAP = 1,
+    TT_MODE_MAC_ONLY   = 2
+} tt_mode = TT_MODE_FULL_IQ;
+
+static int tt_sparse_K       = 4;
+static int tt_mode_init_done = 0;
+
+static void tt_init_mode(void) {
+    if (tt_mode_init_done) return;
+    tt_mode_init_done = 1;
+    const char *m = getenv("TT_FIDELITY_MODE");
+    if (!m) return;
+    if (!strcmp(m, "sparse_tap"))   tt_mode = TT_MODE_SPARSE_TAP;
+    else if (!strcmp(m, "mac_only")) tt_mode = TT_MODE_MAC_ONLY;
+    const char *k = getenv("TT_SPARSE_K");
+    if (k) tt_sparse_K = atoi(k);
+    LOG_I(HW, "[M3] TT_FIDELITY_MODE=%s sparse_K=%d\n", m, tt_sparse_K);
+}
+
+/* O(N*K) partial sort — finds indices of K largest power values (N<=20). */
+static void tt_select_topk(const float *power, int n, int k, int *out_idx) {
+    char used[TT_MAX_K] = {0};
+    int  lim = (k < n) ? k : n;
+    for (int i = 0; i < lim; i++) {
+        float best     = -1.0f;
+        int   best_idx = 0;
+        for (int j = 0; j < n; j++) {
+            if (!used[j] && power[j] > best) {
+                best     = power[j];
+                best_idx = j;
+            }
+        }
+        out_idx[i] = best_idx;
+        used[best_idx] = 1;
+    }
+}
 
 extern long long unsigned int timing_array[_ARRAY_SIZE];
 extern int timing_array_index;
@@ -168,7 +217,14 @@ void rxAddInput(const c16_t *input_sig,
   float mchannelModelr[20]={1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   float mchannelModeli[20]={0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
       //printf("hiii\n");
-    
+
+  /* M3: check mode once, short-circuit if mac_only */
+  tt_init_mode();
+  if (tt_mode == TT_MODE_MAC_ONLY) {
+      /* Twin MAC operates on analytically-injected CQI; skip RFsim PHY. */
+      return;
+  }
+
     struct timespec start, end; // Structs to store time
     long long unsigned int diff; // Variable to store time difference
     clock_gettime(CLOCK_REALTIME, &start); // Log start time
@@ -216,19 +272,27 @@ void rxAddInput(const c16_t *input_sig,
     diff = (end.tv_sec - start.tv_sec) * 1e9 + (end.tv_nsec - start.tv_nsec);
     // if (timing_array_index < _ARRAY_SIZE) {
     //   timing_array[timing_array_index] = diff;
-    //   timing_array_index = timing_array_index + 1;  
+    //   timing_array_index = timing_array_index + 1;
     // }
 
-  // struct timespec start, end, diff; // Structs to store time
-  // long long unsigned int diff; // Variable to store time difference
-  // clock_gettime(CLOCK_REALTIME, &start); // Log start time
+  /* M3: sparse_tap — zero out all but top-K taps by power, then fall through */
+  if (tt_mode == TT_MODE_SPARSE_TAP) {
+      float power[TT_MAX_K];
+      int   top_idx[TT_MAX_K];
+      int   lim = (taplen < TT_MAX_K) ? taplen : TT_MAX_K;
+      for (int k = 0; k < lim; k++)
+          power[k] = mchannelModelr[k]*mchannelModelr[k] + mchannelModeli[k]*mchannelModeli[k];
+      tt_select_topk(power, lim, tt_sparse_K, top_idx);
+      for (int k = 0; k < lim; k++) {
+          int keep = 0;
+          for (int j = 0; j < tt_sparse_K && j < lim; j++)
+              if (top_idx[j] == k) { keep = 1; break; }
+          if (!keep) { mchannelModelr[k] = 0.0f; mchannelModeli[k] = 0.0f; }
+      }
+  }
+  /* TT_MODE_FULL_IQ — original convolution path, unchanged */
 
-  // if (fplog != NULL) {
-  //       fprintf(fplog, "Function started at: %ld.%09ld seconds\n", start.tv_sec, start.tv_nsec);
-  //       fflush(fplog); // Ensure it's written to the file immediately
-  // }
-
-    // assign value to threads
+  // assign value to threads
   int threads = 4;
 
   // assign value to chunk    

@@ -1,6 +1,12 @@
 # vim swp
 *.swp
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+orchestrator/metrics_lake/
+
 # log and exec file
 cmake_targets/log/
 cmake_targets/*/build/
