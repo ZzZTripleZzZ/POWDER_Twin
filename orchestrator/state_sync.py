@@ -43,6 +43,10 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import AsyncIterator
 
+# SSH config: only pass if it exists (not available when running on remote nodes)
+_SSH_CFG_PATH = Path.home() / ".ssh" / "config"
+_SSH_CFG = [_SSH_CFG_PATH] if _SSH_CFG_PATH.exists() else None
+
 import asyncssh
 import zmq
 
@@ -82,7 +86,7 @@ _BLER_MIN_SAMPLES = 8
 
 async def _tail_snr_log(host: str, log_path: str = "~/Tiny_Twin/logs/snr.txt") -> AsyncIterator[str]:
     """SSH tail -f the real-side snr.txt, yield lines."""
-    async with asyncssh.connect(host, username=USERNAME, known_hosts=None, config=[Path.home() / ".ssh" / "config"]) as conn:
+    async with asyncssh.connect(host, username=USERNAME, known_hosts=None, config=_SSH_CFG) as conn:
         async with conn.create_process(f"tail -F {log_path}") as proc:
             async for line in proc.stdout:
                 yield line.strip()
@@ -347,7 +351,7 @@ async def layer1_channel_sync(
     async def _run_remote_fifo():
         """Push CIR to twin via asyncssh cat tunnel (original Mac-as-orchestrator mode)."""
         nonlocal _m3_cqi_count, _m3_last_mode
-        async with asyncssh.connect(twin_host, username=USERNAME, known_hosts=None, config=[Path.home() / ".ssh" / "config"]) as twin_conn:
+        async with asyncssh.connect(twin_host, username=USERNAME, known_hosts=None, config=_SSH_CFG) as twin_conn:
             rnti_pipes = {}
             _pipes_ready = False
 

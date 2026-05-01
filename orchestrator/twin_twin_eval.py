@@ -71,6 +71,9 @@ FIFO_IMAG  = "/tmp/tt_cir_imag.fifo"
 METRICS_PORT   = 5555
 RECONCILE_PORT = 5560
 
+# Cache of SSH-alias → resolved IP (populated in check_connectivity)
+_node_ip: dict[str, str] = {}
+
 # Experiment durations (seconds) — shortened by --quick
 DUR_E1_WARMUP = 30
 DUR_E3        = 120
@@ -105,10 +108,16 @@ async def check_connectivity(real: str, twin: str) -> bool:
         try:
             out = await _ssh(
                 host,
-                "hostname && sudo docker images --format '{{.Repository}}:{{.Tag}}' "
+                "hostname && "
+                "ip addr show eno1 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 && "
+                "sudo docker images --format '{{.Repository}}:{{.Tag}}' "
                 "| grep tt-gnb | head -1",
             )
-            hostname  = out.strip().split("\n")[0]
+            lines     = out.strip().split("\n")
+            hostname  = lines[0]
+            # second line is the node IP (used for ZMQ connections, which don't use SSH config)
+            if len(lines) >= 2 and lines[1].count(".") == 3:
+                _node_ip[host] = lines[1]
             has_image = "tt-gnb" in out
             status    = "OK" if has_image else "WARN: tt-gnb image missing"
             print(f"  [{status}] {label} ({host}) → {hostname}", flush=True)
@@ -168,11 +177,15 @@ async def start_state_sync_on_twin(twin: str, real: str) -> None:
         f"pkill -f state_sync.py || true; sleep 1; rm -f {FIFO_REAL} {FIFO_IMAG}",
         check=False)
 
+    # Use resolved IP for real-host: state_sync runs on powder-twin which can't
+    # resolve SSH aliases like "powder-real" via DNS
+    real_ip = _node_ip.get(real, real)
+    twin_ip = _node_ip.get(twin, twin)
     cmd = (
         f"cd {REPO_DIR} && "
         f"python3 -m orchestrator.state_sync "
-        f"--real-host {real} "
-        f"--twin-host {twin} "
+        f"--real-host {real_ip} "
+        f"--twin-host {twin_ip} "
         f"--local-fifo "
         f"--drift-log /tmp/drift_e1.csv"
     )
@@ -241,16 +254,18 @@ async def wait_for_metrics(real: str, twin: str, timeout_s: int = 120) -> bool:
     ctx = zmq.Context.instance()
     results: dict[str, int] = {}
     for host, label in [(real, "real"), (twin, "twin")]:
+        # SSH aliases (e.g. "powder-real") are not DNS-resolvable; use cached IP
+        zmq_host = _node_ip.get(host, host)
         sock = ctx.socket(zmq.SUB)
-        sock.connect(f"tcp://{host}:{METRICS_PORT}")
+        sock.connect(f"tcp://{zmq_host}:{METRICS_PORT}")
         sock.setsockopt(zmq.SUBSCRIBE, b"")
         sock.setsockopt(zmq.RCVTIMEO, timeout_s * 1000)
         try:
             raw = sock.recv()
             results[label] = len(raw)
-            print(f"  [OK] {label} ({host}): {len(raw)} bytes", flush=True)
+            print(f"  [OK] {label} ({zmq_host}): {len(raw)} bytes", flush=True)
         except Exception:
-            print(f"  [FAIL] No metrics from {label} ({host}) within {timeout_s}s", flush=True)
+            print(f"  [FAIL] No metrics from {label} ({zmq_host}) within {timeout_s}s", flush=True)
             results[label] = 0
         sock.close()
     return all(v > 0 for v in results.values())
@@ -276,9 +291,10 @@ async def run_e1_check(twin: str, warmup_s: int) -> dict:
 
 def run_e3(twin: str, n_samples: int, m_trials: int) -> dict:
     print("\n=== E3: M3 overhead sweep ===", flush=True)
+    twin_ip = _node_ip.get(twin, twin)
     r = subprocess.run([
         sys.executable, "orchestrator/m3_overhead_eval.py",
-        "--twin-host", twin,
+        "--twin-host", twin_ip,
         "--n-samples", str(n_samples),
         "--m-trials",  str(m_trials),
         "--out",       "logs/e3_overhead.csv",
@@ -293,9 +309,10 @@ def run_e3(twin: str, n_samples: int, m_trials: int) -> dict:
 def run_e5(twin: str, duration_s: int, k: int = 100) -> dict:
     """Connect mac_equivalence_twin_client to MacReconciler on twin:5560."""
     print("\n=== E5: MAC equivalence (twin client → reconciler) ===", flush=True)
+    twin_ip = _node_ip.get(twin, twin)
     r = subprocess.run([
         sys.executable, "orchestrator/mac_equivalence_twin_client.py",
-        "--real-host",   twin,         # reconciler runs on twin (layer2_mac_sync)
+        "--real-host",   twin_ip,      # reconciler runs on twin (layer2_mac_sync)
         "--k-reconcile", str(k),
         "--duration",    str(duration_s),
         "--out",         "logs/e5_reconcile.csv",
@@ -321,10 +338,12 @@ def run_e5(twin: str, duration_s: int, k: int = 100) -> dict:
 
 def run_e6(real: str, twin: str, duration_s: int) -> dict:
     print("\n=== E6: KPI similarity ===", flush=True)
+    real_ip = _node_ip.get(real, real)
+    twin_ip = _node_ip.get(twin, twin)
     r = subprocess.run([
         sys.executable, "orchestrator/e6_kpi_similarity.py",
-        "--real-host", real,
-        "--twin-host", twin,
+        "--real-host", real_ip,
+        "--twin-host", twin_ip,
         "--duration",  str(duration_s),
         "--interval",  "5",
         "--out",       "logs/e6_kpi_similarity.csv",
