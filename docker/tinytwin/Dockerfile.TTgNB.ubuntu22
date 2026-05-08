@@ -17,6 +17,13 @@ ENV TZ=Europe/Paris
 # ENV BUILD_UHD_FROM_SOURCE=True
 # ENV UHD_VERSION=4.4.0.0
 
+# POWDER nodes occasionally fail DNS resolution for the default Ubuntu mirrors
+# from inside Docker builds. Use a mirror that is reachable from Emulab.
+RUN sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.edge.kernel.org/ubuntu/|g' \
+        -e 's|http://security.ubuntu.com/ubuntu/|http://mirrors.edge.kernel.org/ubuntu/|g' \
+        /etc/apt/sources.list.d/ubuntu.sources
+
 #install developers pkg/repo
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes && \
@@ -131,7 +138,9 @@ RUN apt-get update && \
         python3-six \
         python3-requests \
         libusb-1.0-0 \
-        libyaml-cpp-dev && \
+        libyaml-cpp-dev \
+        uhd-host \
+        libuhd-dev && \
     # if the --sanitize option was used to build, additional packages are required
     /bin/bash -c 'if [[ "$BUILD_OPTION" = "--sanitize" ]]; then DEBIAN_FRONTEND=noninteractive apt-get install --yes \
         #libasan5 \ # see below
@@ -164,16 +173,15 @@ RUN /bin/sh oaienv && \
     cd cmake_targets && \
     mkdir -p log && \
     ./build_oai -C && \
-    ./build_oai -I -w SIMU \
+    ./build_oai -I -w USRP \
         --gNB --nrUE \
         --build-lib "telnetsrv enbscope uescope nrscope" \
         --cmake-opt -DXAPP_MULTILANGUAGE=OFF --cmake-opt -DKPM_VERSION=$KPM_VERSION --cmake-opt -DE2AP_VERSION=$E2AP_VERSION \
         --cmake-opt -DCMAKE_C_FLAGS="-w" --cmake-opt -DCMAKE_CXX_FLAGS="-w" $BUILD_OPTION && \
-    #     #--cmake-opt -DCMAKE_C_FLAGS="-Werror" --cmake-opt -DCMAKE_CXX_FLAGS="-Werror" $BUILD_OPTION && \
-    # Mainly to see if the sanitize option was perfectly executed
+    ln -sf /usr/local/lib/liboai_usrpdevif.so /usr/local/lib/liboai_device.so && \
+    ldconfig && \
     echo "---- ldd on executables ----" && \
     ldd ran_build/build/*softmodem* ran_build/build/nr-cuup && \
-    # ran_build/build/oairu && \
     echo "---- ldd on shared libraries ----" && \
     ldd ran_build/build/*.so
 WORKDIR /opt/tt-ran/tt
