@@ -169,6 +169,9 @@ RUN apt-get update && \
 #         /usr/local/lib/libtelnetsrv.so \
 #         /usr/local/lib/libtelnetsrv_ci.so \
 #         /usr/local/lib/libuhd.so.4.4.0
+# Patch OAI build_helper for Ubuntu 24.04: python-tk -> python3-tk (no longer in noble repos)
+RUN sed -i 's/python-tk/python3-tk/g' cmake_targets/tools/build_helper
+
 RUN /bin/sh oaienv && \
     cd cmake_targets && \
     mkdir -p log && \
