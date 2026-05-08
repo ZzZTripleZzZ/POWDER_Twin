@@ -7,7 +7,7 @@ Topology:
                               accesses X310 radio over Ethernet via UHD
   twin      (d430)         -- Tiny_Twin gNB + CN (Docker, RFsim + CIR FIFO)
   gnb-x310-2 (ota-x310-2) }
-  gnb-x310-3 (ota-x310-3) } X310 SDR pool — orchestrator probes each at run
+  gnb-x310-3 (ota-x310-3) } X310 SDR pool - orchestrator probes each at run
   gnb-x310-4 (ota-x310-4) } time and selects whichever responds to UHD.
   ue-nuc1~4 (ota-nuc1~4)  -- Intel NUC nodes with Quectel RM500Q COTS 5G UEs
 
