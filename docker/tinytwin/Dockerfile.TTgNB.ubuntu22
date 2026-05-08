@@ -91,11 +91,17 @@ RUN apt-get install -y libzmq3-dev
 RUN apt-get install -y protobuf-compiler libprotobuf-dev
     
 # CMAKE_PREFIX_PATH must include /usr so find_package(UHD) locates
-# UHDConfig.cmake at /usr/lib/x86_64-linux-gnu/cmake/uhd/. The original
-# /usr/include/yaml-cpp-only value masked the system search and caused
-# OAI's radio/USRP/CMakeLists.txt:2 find_package(UHD) to fail even with
-# libuhd-dev installed.
+# UHDConfig.cmake at /usr/lib/x86_64-linux-gnu/cmake/uhd/. UHD_DIR is
+# read by UHDConfig.cmake itself (`set(UHD_DIR $ENV{UHD_DIR})`) and
+# adds /usr/include + /usr/lib to its HINTS — find_library then walks
+# the multiarch arch-triple path (/usr/lib/x86_64-linux-gnu) and locates
+# libuhd.so. Without this, on Ubuntu 24.04 noble (UHD 4.6.0+) the
+# UHDConfig.cmake at line 90 calls get_filename_component on an empty
+# UHD_LIBRARIES and dies with "incorrect number of arguments".
 ENV CMAKE_PREFIX_PATH=/usr:/usr/local:/usr/include/yaml-cpp
+ENV UHD_DIR=/usr
+ENV CMAKE_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu
+ENV CMAKE_INCLUDE_PATH=/usr/include
 
 # build all targets so final targets can be created afterwards
 # RUN /bin/sh oaienv && \
@@ -155,15 +161,16 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Make libuhd-dev's CMake config visible to find_package(UHD).
-# CMake searches /usr/lib/cmake/<Pkg>/ unconditionally, but libuhd-dev
-# installs into /usr/lib/x86_64-linux-gnu/cmake/uhd/ (only searched when
-# CMAKE_PREFIX_PATH is right; OAI's build_oai strips that env). We use a
-# DIRECTORY SYMLINK rather than copy so UHDConfig.cmake's relative-path
-# math (`${CMAKE_CURRENT_LIST_DIR}/../../...`) resolves to the original
-# /usr install prefix instead of breaking with an "incorrect number of
-# arguments" error.
-RUN mkdir -p /usr/lib/cmake && \
-    ln -sfn /usr/lib/x86_64-linux-gnu/cmake/uhd /usr/lib/cmake/UHD && \
+# CMake searches /usr/lib/cmake/<Pkg>/ unconditionally; libuhd-dev installs
+# to /usr/lib/x86_64-linux-gnu/cmake/uhd/ which is only found when
+# CMAKE_PREFIX_PATH carries /usr — and OAI's build_oai strips env.
+# A directory symlink doesn't satisfy CMake's find_package directory
+# scan (empirically: returns "could not find UHDConfig.cmake"), so use
+# a plain file copy. UHDConfig.cmake on noble (UHD 4.6) doesn't rely on
+# its own location for path math, only on UHD_LIBRARIES from find_library
+# - which we make succeed via the ENV UHD_DIR / CMAKE_LIBRARY_PATH above.
+RUN mkdir -p /usr/lib/cmake/UHD && \
+    cp -a /usr/lib/x86_64-linux-gnu/cmake/uhd/. /usr/lib/cmake/UHD/ && \
     ls -la /usr/lib/cmake/UHD/
 
 # Patch OAI's USRP CMakeLists.txt: the original `find_package(UHD REQUIRED UHD)`
