@@ -47,7 +47,14 @@ from typing import AsyncIterator
 _SSH_CFG_PATH = Path.home() / ".ssh" / "config"
 _SSH_CFG = [_SSH_CFG_PATH] if _SSH_CFG_PATH.exists() else None
 
-import asyncssh
+# asyncssh is only needed for the SSH-tail real-host code paths (layer1
+# remote_fifo, _tail_snr_log, _poll_twin_snr). Import lazily so that
+# layer2_mac_sync and the mock verification driver run on machines without
+# asyncssh installed.
+try:
+    import asyncssh    # type: ignore
+except ImportError:
+    asyncssh = None    # type: ignore
 import zmq
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -68,7 +75,7 @@ TWIN_MCS_PORT      = 5557   # EdgeRIC SUB (MCS)
 PIPE_REAL_TMPL = "/tmp/tt_cir_real.fifo"
 PIPE_IMAG_TMPL = "/tmp/tt_cir_imag.fifo"
 
-USERNAME = "zifan716"
+USERNAME = os.environ.get("DT_SYNC_USER", "zifan716")
 
 # Regex to extract UL SNR from twin gNB docker logs
 _UL_SNR_RE = re.compile(r"ulsch_rounds.*?SNR ([\d.]+) dB")
@@ -109,13 +116,36 @@ async def _poll_twin_snr(conn, snr_box: list, interval: float = CAL_POLL_INTERVA
         await asyncio.sleep(interval)
 
 
+async def _wait_tt_gnb_ready(timeout_s: float = 30.0) -> bool:
+    """Poll `docker ps` until tt-gnb is in 'running' state. Best-effort readiness
+    signal — the container being up does not strictly mean the OAI process inside
+    has reopened the FIFO, but combined with the post-up settle sleep this is
+    accurate enough for M3's minute-cadence mode switches."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "ps", "--filter", "name=tt-gnb",
+                "--filter", "status=running", "--format", "{{.Names}}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            if b"tt-gnb" in out:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+
 async def _restart_production_twin(mode: Mode, twin_host: str = None) -> None:
     """Gracefully restart the production tt-gnb container with a new TT_FIDELITY_MODE.
 
     Stops the running container, then recreates it with TT_FIDELITY_MODE updated
     via docker-compose (preferred) or a plain docker stop/start sequence.
-    The FIFO writer continues on the Python side; the 2-3 s gap is acceptable
-    because mode decisions are made at ≥60 s cadence (M3 claim is minute-level).
+    Returns only after the container is observed running again, so the caller
+    can flip the active mode atomically.
     """
     print(f"[M3] Restarting production twin with mode={mode.value}", flush=True)
     if twin_host is None:
@@ -147,6 +177,12 @@ async def _restart_production_twin(mode: Mode, twin_host: str = None) -> None:
                 print(f"[M3] Fallback stop/start done (env must be set in compose file)", flush=True)
         except Exception as e:
             print(f"[M3] Restart failed: {e}", flush=True)
+            return
+        # Wait for container to come back, then a short settle window so the
+        # OAI process inside has time to reopen the FIFO.
+        if not await _wait_tt_gnb_ready(timeout_s=30.0):
+            print(f"[M3] tt-gnb did not become ready within 30s after restart", flush=True)
+        await asyncio.sleep(2.0)
     # Remote restart goes through asyncssh; left as extension point.
 
 
@@ -178,15 +214,45 @@ async def layer1_channel_sync(
     rolling_acks: "defaultdict[int, deque[int]]" = defaultdict(
         lambda: deque(maxlen=_BLER_WINDOW)
     )
+    # M1: per-RNTI rolling window of UL ACK outcomes harvested from the twin
+    # gNB's own log stream. When populated, _twin_bler returns a measured
+    # value and the KL drift metric becomes a true 2-D joint distribution
+    # over (CQI, BLER). When empty, we fall back to bler_from_snr, which
+    # collapses BLER to a deterministic function of twin SNR.
+    twin_rolling_acks: "defaultdict[int, deque[int]]" = defaultdict(
+        lambda: deque(maxlen=_BLER_WINDOW)
+    )
+    # Diagnostic counter: number of drift samples that fell back to analytic
+    # twin_bler because no real twin ACK data was yet available.
+    _twin_bler_fallback_count = [0]
 
-    # M3: mode selector state
+    # M3: mode selector state. The selector decides a *pending* mode whenever
+    # signals shift; the *active* mode (what the C-side container is currently
+    # configured for) only flips after the docker restart finishes. During the
+    # restart window, FIFO writes are suppressed so the Python writer doesn't
+    # block on a closed reader (full_iq → mac_only) or push data the C side is
+    # no longer reading (mac_only → sparse_tap).
     _m3_selector      = RuleBasedSelector()
-    _m3_last_mode     = Mode.FULL_IQ
+    _m3_state         = {
+        "active":      Mode.FULL_IQ,
+        "pending":     None,
+        "restarting":  False,
+    }
     _m3_last_recal_t  = 0.0       # time.time() of last M1 trigger
     _m3_cqi_window: list          = []
     _m3_last_verdicts: list       = []   # updated by oracle callback if wired
     _m3_cqi_count     = 0
     K_MODE_CHECK      = 50        # re-evaluate mode every N CQI observations
+
+    async def _apply_mode_change(new_mode: Mode, twin_host_arg=None) -> None:
+        """Run the docker restart, then atomically flip the active mode."""
+        try:
+            await _restart_production_twin(new_mode, twin_host=twin_host_arg)
+            _m3_state["active"] = new_mode
+            print(f"[M3] active mode now {new_mode.value}", flush=True)
+        finally:
+            _m3_state["pending"]    = None
+            _m3_state["restarting"] = False
 
     # E1 figure: D(t) CSV writer (None if no path given)
     _drift_csv_file   = None
@@ -223,6 +289,12 @@ async def layer1_channel_sync(
         # OAI logs UL ACK: 1 = success, 0 = NAK; BLER = fraction of NAKs.
         return 1.0 - (sum(acks) / len(acks))
 
+    def _twin_bler(rnti: int) -> "float | None":
+        acks = twin_rolling_acks.get(rnti)
+        if acks is None or len(acks) < _BLER_MIN_SAMPLES:
+            return None
+        return 1.0 - (sum(acks) / len(acks))
+
     def _maybe_drift_observe(real_cqi: int, rnti: int) -> None:
         """M1: feed one paired (real, twin) sample to the calibrator's drift buffer.
         Only fires when we have a fresh twin SNR and enough real ACKs."""
@@ -233,7 +305,19 @@ async def layer1_channel_sync(
             return
         twin_snr = snr_box[0]
         twin_cqi = snr_db_to_cqi(twin_snr)
-        twin_bler = bler_from_snr(twin_snr)
+        measured_tb = _twin_bler(rnti)
+        if measured_tb is not None:
+            twin_bler = measured_tb
+        else:
+            twin_bler = bler_from_snr(twin_snr)
+            _twin_bler_fallback_count[0] += 1
+            if _twin_bler_fallback_count[0] == 1:
+                print(
+                    "[M1] twin_bler falling back to analytic bler_from_snr "
+                    "(no twin ACK stream yet); KL drift metric is degraded "
+                    "to 1-D until twin ACKs arrive.",
+                    flush=True,
+                )
         calibrator.observe_drift_sample(
             real_cqi=real_cqi, real_bler=rb,
             twin_cqi=twin_cqi, twin_bler=twin_bler,
@@ -253,19 +337,33 @@ async def layer1_channel_sync(
 
     async def _run_local_fifo():
         """Write CIR directly to local FIFOs (no SSH to twin)."""
-        nonlocal _m3_cqi_count, _m3_last_mode
+        nonlocal _m3_cqi_count
         import os
         for p in (PIPE_REAL_TMPL, PIPE_IMAG_TMPL):
             if not os.path.exists(p):
                 os.mkfifo(p)
 
-        # Open FIFOs in a thread (open blocks until reader connects)
         loop = asyncio.get_event_loop()
-        fr, fi = await asyncio.gather(
-            loop.run_in_executor(None, lambda: open(PIPE_REAL_TMPL, "w", buffering=1)),
-            loop.run_in_executor(None, lambda: open(PIPE_IMAG_TMPL, "w", buffering=1)),
-        )
-        print(f"[L1] Local FIFOs open: {PIPE_REAL_TMPL}", flush=True)
+
+        async def _open_local_fifos():
+            # Open FIFOs in a thread (open blocks until reader connects).
+            handles = await asyncio.gather(
+                loop.run_in_executor(None, lambda: open(PIPE_REAL_TMPL, "w", buffering=1)),
+                loop.run_in_executor(None, lambda: open(PIPE_IMAG_TMPL, "w", buffering=1)),
+            )
+            print(f"[L1] Local FIFOs open: {PIPE_REAL_TMPL}", flush=True)
+            return handles
+
+        async def _reopen_local_fifos(old_fr, old_fi):
+            for fh in (old_fr, old_fi):
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            print("[L1][WARN] FIFO reader disconnected; reopening local FIFOs", flush=True)
+            return await _open_local_fifos()
+
+        fr, fi = await _open_local_fifos()
 
         # Calibration: poll twin gNB docker logs locally (non-blocking asyncio subprocess)
         async def poll_snr_local():
@@ -284,7 +382,34 @@ async def layer1_channel_sync(
                     snr_box[0] = None
                 await asyncio.sleep(CAL_POLL_INTERVAL)
 
-        snr_task = asyncio.ensure_future(poll_snr_local())
+        # M1: stream twin gNB log to harvest UL ACKs into twin_rolling_acks
+        # so the KL joint distribution has a real (CQI, BLER) twin marginal.
+        async def stream_twin_acks_local():
+            backoff = 1.0
+            while True:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "docker", "logs", "-f", "--tail", "0", "tt-gnb",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    assert proc.stdout is not None
+                    backoff = 1.0
+                    async for raw in proc.stdout:
+                        line = raw.decode("utf-8", errors="ignore").strip()
+                        if mt := ack_re.search(line):
+                            a = int(mt.group(1))
+                            r = int(mt.group(2), 16)
+                            if rnti_filter is not None and r != rnti_filter:
+                                continue
+                            twin_rolling_acks[r].append(a)
+                except Exception as e:
+                    print(f"[M1] twin ACK stream error: {e}; retrying in {backoff:.0f}s", flush=True)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2.0, 30.0)
+
+        snr_task       = asyncio.ensure_future(poll_snr_local())
+        twin_ack_task  = asyncio.ensure_future(stream_twin_acks_local())
         try:
             async for line in _tail_snr_log(real_host):
                 if m := tti_re.match(line):
@@ -315,42 +440,60 @@ async def layer1_channel_sync(
                             _m3_last_recal_t, rnti_count=len(rolling_acks),
                         )
                         new_mode = _m3_selector.choose_mode(sig)
-                        if new_mode != _m3_last_mode:
+                        target = _m3_state["pending"] or _m3_state["active"]
+                        if new_mode != target and not _m3_state["restarting"]:
                             d_str = f"  D(t)={sig.D_t:.3f}" if sig.D_t is not None else ""
-                            print(f"[M3] mode {_m3_last_mode.value} → {new_mode.value}{d_str}",
-                                  flush=True)
-                            _m3_last_mode = new_mode
-                            asyncio.ensure_future(
-                                _restart_production_twin(new_mode, twin_host=None)
+                            print(
+                                f"[M3] mode {_m3_state['active'].value} "
+                                f"→ {new_mode.value} (pending){d_str}",
+                                flush=True,
                             )
+                            _m3_state["pending"]    = new_mode
+                            _m3_state["restarting"] = True
+                            asyncio.ensure_future(_apply_mode_change(new_mode, None))
 
-                    # M3: gate FIFO write; apply sparsify if sparse_tap
-                    with cir_writer_gate(_m3_last_mode) as should_write:
-                        if should_write:
-                            r_taps, i_taps = cqi_to_cir(cqi, calibrator=calibrator, rng=rng)
-                            if _m3_last_mode == Mode.SPARSE_TAP:
-                                r_taps, i_taps = sparsify_topk(r_taps, i_taps, K=4)
-                            fr.write(" ".join(f"{v:.6f}" for v in r_taps) + "\n")
-                            fi.write(" ".join(f"{v:.6f}" for v in i_taps) + "\n")
+                    # M3: gate FIFO write on the *active* mode (the C side's
+                    # current TT_FIDELITY_MODE). During a restart the C side
+                    # has no reader on the FIFO, so suppress writes entirely
+                    # to avoid blocking the writer.
+                    if not _m3_state["restarting"]:
+                        active_mode = _m3_state["active"]
+                        with cir_writer_gate(active_mode) as should_write:
+                            if should_write:
+                                r_taps, i_taps = cqi_to_cir(cqi, calibrator=calibrator, rng=rng)
+                                if active_mode == Mode.SPARSE_TAP:
+                                    r_taps, i_taps = sparsify_topk(r_taps, i_taps, K=4)
+                                try:
+                                    fr.write(" ".join(f"{v:.6f}" for v in r_taps) + "\n")
+                                    fi.write(" ".join(f"{v:.6f}" for v in i_taps) + "\n")
+                                except BrokenPipeError:
+                                    fr, fi = await _reopen_local_fifos(fr, fi)
+                                    continue
 
                     _log_drift_if_due()
                     now = time.time()
                     if calibrator is not None and now - last_cal_log[0] > CAL_LOG_INTERVAL:
                         print(
                             f"[L1] {calibrator.summary()} | twin_snr={snr_box[0]} dB"
-                            f" | M3_mode={_m3_last_mode.value}",
+                            f" | M3_mode={_m3_state['active'].value}"
+                            f"{' (pending=' + _m3_state['pending'].value + ')' if _m3_state['pending'] else ''}",
                             flush=True,
                         )
                         last_cal_log[0] = now
         finally:
             snr_task.cancel()
-            fr.close(); fi.close()
+            twin_ack_task.cancel()
+            for fh in (fr, fi):
+                try:
+                    fh.close()
+                except Exception:
+                    pass
             if _drift_csv_file:
                 _drift_csv_file.close()
 
     async def _run_remote_fifo():
         """Push CIR to twin via asyncssh cat tunnel (original Mac-as-orchestrator mode)."""
-        nonlocal _m3_cqi_count, _m3_last_mode
+        nonlocal _m3_cqi_count
         async with asyncssh.connect(twin_host, username=USERNAME, known_hosts=None, config=_SSH_CFG) as twin_conn:
             rnti_pipes = {}
             _pipes_ready = False
@@ -370,6 +513,36 @@ async def layer1_channel_sync(
             cal_task = asyncio.ensure_future(
                 _poll_twin_snr(twin_conn, snr_box, CAL_POLL_INTERVAL)
             )
+
+            # M1: stream the twin gNB log over SSH so we have a real
+            # twin-side BLER marginal in the KL joint distribution.
+            # Without this the remote (Mac-as-orchestrator) mode falls
+            # back to analytic BLER from the 10s-polled SNR snapshot,
+            # collapsing the (CQI,BLER) histogram to 1-D and silently
+            # breaking M1's drift detection.
+            async def stream_twin_acks_remote():
+                backoff = 1.0
+                cmd = "sudo docker logs -f --tail 0 tt-gnb 2>&1 || true"
+                while True:
+                    try:
+                        proc = await twin_conn.create_process(cmd)
+                        backoff = 1.0
+                        async for raw in proc.stdout:
+                            line = raw.decode("utf-8", errors="ignore").strip() if isinstance(raw, (bytes, bytearray)) else raw.strip()
+                            if mt := ack_re.search(line):
+                                a = int(mt.group(1))
+                                r = int(mt.group(2), 16)
+                                if rnti_filter is not None and r != rnti_filter:
+                                    continue
+                                twin_rolling_acks[r].append(a)
+                    except Exception as e:
+                        print(f"[M1] remote twin ACK stream error: {e}; "
+                              f"retrying in {backoff:.0f}s", flush=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2.0, 30.0)
+
+            twin_ack_task = asyncio.ensure_future(stream_twin_acks_remote())
+
             try:
                 async for line in _tail_snr_log(real_host):
                     if m := tti_re.match(line):
@@ -400,36 +573,47 @@ async def layer1_channel_sync(
                                 _m3_last_recal_t, rnti_count=len(rolling_acks),
                             )
                             new_mode = _m3_selector.choose_mode(sig)
-                            if new_mode != _m3_last_mode:
+                            target = _m3_state["pending"] or _m3_state["active"]
+                            if new_mode != target and not _m3_state["restarting"]:
                                 d_str = f"  D(t)={sig.D_t:.3f}" if sig.D_t is not None else ""
-                                print(f"[M3] mode {_m3_last_mode.value} → {new_mode.value}{d_str}",
-                                      flush=True)
-                                _m3_last_mode = new_mode
+                                print(
+                                    f"[M3] mode {_m3_state['active'].value} "
+                                    f"→ {new_mode.value} (pending){d_str}",
+                                    flush=True,
+                                )
+                                _m3_state["pending"]    = new_mode
+                                _m3_state["restarting"] = True
+                                asyncio.ensure_future(_apply_mode_change(new_mode, twin_host))
 
-                        # M3: gate FIFO write; apply sparsify if sparse_tap
-                        with cir_writer_gate(_m3_last_mode) as should_write:
-                            if should_write:
-                                await ensure_pipe(rnti)
-                                r_taps, i_taps = cqi_to_cir(cqi, calibrator=calibrator, rng=rng)
-                                if _m3_last_mode == Mode.SPARSE_TAP:
-                                    r_taps, i_taps = sparsify_topk(r_taps, i_taps, K=4)
-                                r_line = " ".join(f"{v:.6f}" for v in r_taps) + "\n"
-                                i_line = " ".join(f"{v:.6f}" for v in i_taps) + "\n"
-                                rw, iw = rnti_pipes[rnti]
-                                rw.write(r_line)
-                                iw.write(i_line)
+                        # M3: gate FIFO write on the *active* mode and skip
+                        # entirely while a restart is in flight (remote C side
+                        # is down → SSH cat reader is gone, write would block).
+                        if not _m3_state["restarting"]:
+                            active_mode = _m3_state["active"]
+                            with cir_writer_gate(active_mode) as should_write:
+                                if should_write:
+                                    await ensure_pipe(rnti)
+                                    r_taps, i_taps = cqi_to_cir(cqi, calibrator=calibrator, rng=rng)
+                                    if active_mode == Mode.SPARSE_TAP:
+                                        r_taps, i_taps = sparsify_topk(r_taps, i_taps, K=4)
+                                    r_line = " ".join(f"{v:.6f}" for v in r_taps) + "\n"
+                                    i_line = " ".join(f"{v:.6f}" for v in i_taps) + "\n"
+                                    rw, iw = rnti_pipes[rnti]
+                                    rw.write(r_line)
+                                    iw.write(i_line)
 
                         _log_drift_if_due()
                         now = time.time()
                         if calibrator is not None and now - last_cal_log[0] > CAL_LOG_INTERVAL:
                             print(
                                 f"[L1] {calibrator.summary()} | twin_snr={snr_box[0]} dB"
-                                f" | M3_mode={_m3_last_mode.value}",
+                                f" | M3_mode={_m3_state['active'].value}",
                                 flush=True,
                             )
                             last_cal_log[0] = now
             finally:
                 cal_task.cancel()
+                twin_ack_task.cancel()
                 if _drift_csv_file:
                     _drift_csv_file.close()
 
@@ -449,6 +633,8 @@ def layer2_mac_sync(
     real_host: str,
     twin_host: str,
     K_reconcile: int = 100,
+    oracle=None,
+    real_metrics_host: str | None = None,
 ) -> None:
     """
     M4-augmented MAC sync:
@@ -456,6 +642,8 @@ def layer2_mac_sync(
       - Stamp each forwarded message with tti_seq + per-UE + global state hash
       - Forward stamped protobuf to twin EdgeRIC (port 5655)
       - Bind MacReconciler REP socket on port 5560 for twin-side equivalence checks
+      - If `oracle` is provided, call oracle.update_baseline(compute_reward)
+        per forwarded TTI so M2's CI is anchored to live real-side rewards.
 
     K_reconcile: reconciliation interval in forwarded-TTI units (default 100).
     Reconciliation requests are served non-blocking once per receive loop.
@@ -463,24 +651,31 @@ def layer2_mac_sync(
     sys.path.insert(0, str(Path(__file__).parent.parent / "proto"))
     import metrics_pb2
     from orchestrator.mac_equivalence import MacReconciler, stamp_metrics
+    _compute_reward = None
+    if oracle is not None:
+        from orchestrator.counterfactual_oracle import compute_reward as _compute_reward
 
     ctx = zmq.Context()
 
+    metrics_host = real_metrics_host or real_host
     sub = ctx.socket(zmq.SUB)
-    sub.connect(f"tcp://{real_host}:{REAL_METRICS_PORT}")
+    sub.connect(f"tcp://{metrics_host}:{REAL_METRICS_PORT}")
     sub.setsockopt(zmq.SUBSCRIBE, b"")
-    sub.setsockopt(zmq.CONFLATE, 1)
+    # No CONFLATE: each TTI must reach the twin, otherwise tti_seq has gaps
+    # and the M4 bound K + ⌈(R+S)/T_TTI⌉ is no longer tight (silent drops
+    # masquerade as state divergence). Bound queueing with HWM instead.
+    sub.setsockopt(zmq.RCVHWM, 2000)
     sub.setsockopt(zmq.RCVTIMEO, 200)  # 200ms timeout so reconciliation loop runs
 
     pub = ctx.socket(zmq.PUB)
     pub.bind(f"tcp://0.0.0.0:{REAL_METRICS_PORT + 100}")  # port 5655
 
     reconciler = MacReconciler(bind_endpoint="tcp://*:5560")
-    tti_seq = 0
+    local_tti_seq = 0
 
     print(
         f"[L2] M4 reconciler bound on :5560; "
-        f"forwarding metrics {real_host}:{REAL_METRICS_PORT} → local:{REAL_METRICS_PORT + 100}",
+        f"forwarding metrics {metrics_host}:{REAL_METRICS_PORT} → local:{REAL_METRICS_PORT + 100}",
         flush=True,
     )
     while True:
@@ -488,11 +683,24 @@ def layer2_mac_sync(
             raw = sub.recv()
             metrics = metrics_pb2.Metrics()
             metrics.ParseFromString(raw)
-            tti_seq += 1
+            # Prefer the real-side EdgeRIC's native TTI counter (proto.tti_cnt)
+            # so tti_seq reflects wall-clock TTI rather than orchestrator
+            # message-arrival count. Falls back to local counter if the field
+            # is absent (older real-side build).
+            if metrics.tti_cnt:
+                tti_seq = int(metrics.tti_cnt)
+            else:
+                local_tti_seq += 1
+                tti_seq = local_tti_seq
             # epoch tracks reconciliation events (managed inside MacReconciler)
             stamp_metrics(metrics, tti_seq=tti_seq, epoch=reconciler.epoch)
             reconciler.update(metrics)
             pub.send(metrics.SerializeToString())
+            if oracle is not None:
+                # M2: anchor CI to live real-side rewards. Same reward formula
+                # as oracle rollouts so candidate − baseline differences are
+                # apples-to-apples (same λ, μ, units).
+                oracle.update_baseline(_compute_reward(metrics))
         except zmq.Again:
             pass  # timeout: still run reconciler below
         except zmq.ZMQError as e:
@@ -577,8 +785,12 @@ def fidelity_monitor(
 
 def main():
     parser = argparse.ArgumentParser(description="Real-time dual-layer state sync")
-    parser.add_argument("--real-host", required=True)
-    parser.add_argument("--twin-host", required=True)
+    parser.add_argument("--real-host", default=os.environ.get("DT_SYNC_REAL_HOST"),
+                        required="DT_SYNC_REAL_HOST" not in os.environ)
+    parser.add_argument("--real-metrics-host", default=None,
+                        help="ZMQ hostname/IP for real-side metrics; defaults to --real-host")
+    parser.add_argument("--twin-host", default=os.environ.get("DT_SYNC_TWIN_HOST"),
+                        required="DT_SYNC_TWIN_HOST" not in os.environ)
     parser.add_argument("--rnti", default=None, help="Filter to single RNTI (hex)")
     parser.add_argument("--cal-path", default="logs/calibration.npy",
                         help="Path for calibration state file")
@@ -590,6 +802,10 @@ def main():
                         help="Only run fidelity monitor (no CIR sync)")
     parser.add_argument("--drift-log", default=None,
                         help="CSV path for E1 D(t) time-series (e.g. logs/drift.csv)")
+    parser.add_argument("--with-oracle-baseline", action="store_true",
+                        help="Wire a CounterfactualOracle into layer2_mac_sync so "
+                             "compute_reward(metrics) accumulates as the M2 baseline. "
+                             "Required for any evaluate() call to have non-empty baseline.")
     args = parser.parse_args()
 
     rnti = int(args.rnti, 16) if args.rnti else None
@@ -602,10 +818,18 @@ def main():
     if calibrator is not None:
         print(f"[L1] Calibrator initialized: {calibrator.summary()}", flush=True)
 
+    # Optional oracle for live baseline accumulation (M2 / C3)
+    oracle = None
+    if args.with_oracle_baseline:
+        from orchestrator.counterfactual_oracle import CounterfactualOracle
+        oracle = CounterfactualOracle(twin_host=args.twin_host, mock=True)
+        print(f"[L2] Oracle baseline wired (horizon={oracle._horizon} TTI ring)", flush=True)
+
     # Layer 2 in a background thread
     t2 = threading.Thread(
         target=layer2_mac_sync,
         args=(args.real_host, args.twin_host),
+        kwargs={"oracle": oracle, "real_metrics_host": args.real_metrics_host},
         daemon=True,
     )
     t2.start()

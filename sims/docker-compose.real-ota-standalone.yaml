@@ -1,7 +1,13 @@
-# Standalone compose for real OTA gNB — does NOT overlay docker-compose.twin.yaml.
-# network_mode: host lets the container reach both:
-#   - X310 at 192.168.1.10 (ctrl-lan Ethernet)
-#   - OAI CN AMF at 192.168.70.133 (tt-public-net bridge visible from host)
+# Standalone compose for real OTA gNB - does NOT overlay docker-compose.twin.yaml.
+#
+# Uses the X310/24-PRB conf tuned for the NICELabExp 3430-3450 MHz reservation.
+# real_twin_eval.py probes ota-x310-{2,3,4} and sed-patches sdr_addrs in the
+# host-side conf before this container starts; the file is bind-mounted r/w
+# into the container so the patch takes effect (image-baked conf is overlaid).
+#
+# network_mode: host lets the container reach:
+#   - X310 at 192.168.1.{12,13,14} (ctrl-lan Ethernet, picked at run time)
+#   - OAI CN AMF at 192.168.70.132 via tt-public-net bridge
 #
 # Usage (on gnb-real, after CN is up):
 #   cd ~/Tiny_Twin/sims
@@ -21,7 +27,7 @@ services:
     volumes:
       - ../logs:/tt-ran/logs
       - /tmp:/tmp:rw
-      - ../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf:/tt-ran/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf:ro
+      - ../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.24PRB.usrpx310.dt-ota.conf:/tt-ran/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.24PRB.usrpx310.dt-ota.conf:ro
     entrypoint:
       - /bin/bash
       - -c
@@ -29,5 +35,5 @@ services:
         mkdir -p /tt-ran/logs &&
         cd /tt-ran/cmake_targets/ran_build/build/ &&
         exec ./nr-softmodem
-        -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+        -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.24PRB.usrpx310.dt-ota.conf
         --sa

@@ -281,10 +281,17 @@ def run(
     while (elapsed := time.time() - t0) < duration_s:
         # ── Measure current fidelity ──
         if mock:
-            # Simulate fidelity decay following exp(-t/τ) with noise
+            # Simulate fidelity decay: RMSE *grows* over time after a
+            # recalibration as the channel drifts. Saturating exponential:
+            # rmse(t) = floor + (ceil - floor) * (1 - exp(-t / tau))
+            # so newly-calibrated -> floor; t -> tau gives ~63% of (ceil-floor).
             t_since = time.time() - last_recal_t
-            base_rmse = 0.3 * np.exp(t_since / tau) + np.random.normal(0, 0.05)
-            cqi_rmse = max(0.1, float(base_rmse))
+            floor, ceil = 0.1, 1.5
+            base_rmse = (
+                floor + (ceil - floor) * (1.0 - np.exp(-t_since / tau))
+                + np.random.normal(0, 0.05)
+            )
+            cqi_rmse = max(floor, float(base_rmse))
             real_snap = twin_snap = {}   # unused in mock
         else:
             real_snap = snapshot(real_host, REAL_METRICS_PORT, FIDELITY_SAMPLES, ctx)

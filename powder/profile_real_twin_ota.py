@@ -120,6 +120,14 @@ def _b64_wrap(inner_script):
     return "#!/bin/bash\nset -e\necho " + b64 + " | base64 -d > /tmp/_node_setup.sh\nbash /tmp/_node_setup.sh\n"
 
 
+# OAI USRP build (-w USRP) takes ~45-60 min on a d430. POWDER's startup
+# command runs *synchronously* before marking the node ready, and several
+# clusters timeout the startup at 600 s. We do the fast prerequisites
+# (Docker, UHD, repo clone, network) inline, then fork the heavy docker
+# build into a nohup'd background job that writes ~/.tt-build-complete
+# when it finishes. Orchestrator waits on that sentinel before bringing
+# up containers.
+
 _GNB_REAL_INNER = (
     "#!/bin/bash\n"
     "set -ex\n"
@@ -134,24 +142,31 @@ _GNB_REAL_INNER = (
     "sudo apt-get install -y -q uhd-host python3-uhd\n"
     "sudo uhd_images_downloader -t x3xx\n"
     "\n"
-    "git clone --branch " + params.oai_branch + " " + TINY_TWIN_REPO + " ~/Tiny_Twin\n"
-    "cd ~/Tiny_Twin\n"
-    "sudo docker build --target tt-gnb \\\n"
-    "    --file docker/tinytwin/Dockerfile.TTgNB.ubuntu22 \\\n"
-    "    -t tt-gnb:v2 .\n"
+    "git clone --branch " + params.oai_branch + " " + TINY_TWIN_REPO + " ~/Tiny_Twin || (cd ~/Tiny_Twin && git fetch origin && git checkout " + params.oai_branch + " && git pull)\n"
+    "mkdir -p ~/Tiny_Twin/logs\n"
     "\n"
     "sudo docker network create \\\n"
     "    --driver bridge --subnet 192.168.70.128/26 \\\n"
     "    --opt com.docker.network.bridge.name=tt-public-net \\\n"
     "    tt-public-net 2>/dev/null || true\n"
     "\n"
-    "# X310 selection deferred to orchestrator: real_twin_eval.py probes\n"
-    "# X310_CANDIDATE_IPS at runtime and patches gnb conf with the working IP.\n"
+    "# Fork the heavy OAI USRP build to background (~45 min).\n"
+    "rm -f ~/.tt-build-complete ~/.tt-build-failed\n"
+    "( cd ~/Tiny_Twin && \\\n"
+    "  sudo docker build --target tt-gnb \\\n"
+    "      --file docker/tinytwin/Dockerfile.TTgNB.ubuntu22 \\\n"
+    "      -t tt-gnb:v2 . > /tmp/tt-gnb-build.log 2>&1 \\\n"
+    "  && touch ~/.tt-build-complete \\\n"
+    "  || touch ~/.tt-build-failed \\\n"
+    ") </dev/null >/dev/null 2>&1 &\n"
+    "disown\n"
     "\n"
-    "mkdir -p ~/Tiny_Twin/logs\n"
-    "echo \"gnb-real node ready\"\n"
+    "echo \"gnb-real node ready (build running in background; tail /tmp/tt-gnb-build.log)\"\n"
 )
 
+# Twin builds gnb + nrue *serially* — d430 (64 GB RAM) was OOM-killing the
+# linker when both ran in parallel. Total wall time is ~80 min serial vs.
+# crash-and-restart parallel.
 _TWIN_INNER = (
     "#!/bin/bash\n"
     "set -ex\n"
@@ -162,23 +177,28 @@ _TWIN_INNER = (
     "sudo systemctl enable docker\n"
     "sudo systemctl start docker\n"
     "\n"
-    "git clone --branch " + params.oai_branch + " " + TINY_TWIN_REPO + " ~/Tiny_Twin\n"
-    "cd ~/Tiny_Twin\n"
-    "sudo docker build --target tt-gnb \\\n"
-    "    --file docker/tinytwin/Dockerfile.TTgNB.ubuntu22 \\\n"
-    "    -t tt-gnb:v2 . &\n"
-    "sudo docker build --target tt-nrue \\\n"
-    "    --file docker/tinytwin/Dockerfile.TTnrUE.ubuntu22 \\\n"
-    "    -t tt-nrue:v2 . &\n"
-    "wait\n"
+    "git clone --branch " + params.oai_branch + " " + TINY_TWIN_REPO + " ~/Tiny_Twin || (cd ~/Tiny_Twin && git fetch origin && git checkout " + params.oai_branch + " && git pull)\n"
+    "mkdir -p ~/Tiny_Twin/logs\n"
     "\n"
     "sudo docker network create \\\n"
     "    --driver bridge --subnet 192.168.70.128/26 \\\n"
     "    --opt com.docker.network.bridge.name=tt-public-net \\\n"
     "    tt-public-net 2>/dev/null || true\n"
     "\n"
-    "mkdir -p ~/Tiny_Twin/logs\n"
-    "echo \"twin node ready\"\n"
+    "rm -f ~/.tt-build-complete ~/.tt-build-failed\n"
+    "( cd ~/Tiny_Twin && \\\n"
+    "  sudo docker build --target tt-gnb \\\n"
+    "      --file docker/tinytwin/Dockerfile.TTgNB.ubuntu22 \\\n"
+    "      -t tt-gnb:v2 . > /tmp/tt-gnb-build.log 2>&1 && \\\n"
+    "  sudo docker build --target tt-nrue \\\n"
+    "      --file docker/tinytwin/Dockerfile.TTnrUE.ubuntu22 \\\n"
+    "      -t tt-nrue:v2 . > /tmp/tt-nrue-build.log 2>&1 \\\n"
+    "  && touch ~/.tt-build-complete \\\n"
+    "  || touch ~/.tt-build-failed \\\n"
+    ") </dev/null >/dev/null 2>&1 &\n"
+    "disown\n"
+    "\n"
+    "echo \"twin node ready (builds running in background; tail /tmp/tt-{gnb,nrue}-build.log)\"\n"
 )
 
 _NUC_INNER = (

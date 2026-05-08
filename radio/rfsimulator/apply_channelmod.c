@@ -40,7 +40,8 @@
  *   "sparse_tap"        → top-K taps only; K from TT_SPARSE_K (default 4)
  *   "mac_only"          → skip CIR reads and convolution entirely
  * ─────────────────────────────────────────────────────────────────────────── */
-#define TT_MAX_K 20
+#define TT_MAX_TAPS 100
+#define TT_MAX_TOPK 20
 
 static enum tt_fidelity_mode {
     TT_MODE_FULL_IQ    = 0,
@@ -65,7 +66,7 @@ static void tt_init_mode(void) {
 
 /* O(N*K) partial sort — finds indices of K largest power values (N<=20). */
 static void tt_select_topk(const float *power, int n, int k, int *out_idx) {
-    char used[TT_MAX_K] = {0};
+    char used[TT_MAX_TAPS] = {0};
     int  lim = (k < n) ? k : n;
     for (int i = 0; i < lim; i++) {
         float best     = -1.0f;
@@ -214,8 +215,13 @@ void rxAddInput(const c16_t *input_sig,
   const int nbTx=channelDesc->nb_tx;
    // counterr++;
   // int mylen=1;
-  float mchannelModelr[20]={1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-  float mchannelModeli[20]={0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  /* mchannelModel{r,i} are fixed-size stack buffers; cap taplen against
+   * MCHAN_MODEL_LEN to avoid OOB writes when CIR FIFO supplies > 20 taps
+   * (sparse_tap and full_iq paths both read up to taplen). */
+  #define MCHAN_MODEL_LEN 20
+  float mchannelModelr[MCHAN_MODEL_LEN]={1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  float mchannelModeli[MCHAN_MODEL_LEN]={0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  const int taplen_safe = (taplen < MCHAN_MODEL_LEN) ? taplen : MCHAN_MODEL_LEN;
       //printf("hiii\n");
 
   /* M3: check mode once, short-circuit if mac_only */
@@ -235,27 +241,19 @@ void rxAddInput(const c16_t *input_sig,
     // }
 
     if (fgets(strr, sizeof(strr), fpr[sock_num-first_time]) != NULL) {
-      // Read successful, process the line in strr
-      //printf("Read line: %s", strr);
       char *token1 = strtok(strr, " ");
       int idx1 = 0;
-
-      while (token1 != NULL && idx1 < taplen) {
+      while (token1 != NULL && idx1 < taplen_safe) {
           mchannelModelr[idx1] = atof(token1);
-          //printf("%f\n",mchannelModelr[idx1]);
           token1 = strtok(NULL, " ");
           idx1++;
       }
-      //printf("\n");
     }
-   
+
     if (fgets(stri, sizeof(stri), fpi[sock_num-first_time]) != NULL) {
-      // Read successful, process the line in strr
-      //printf("Read line: %s", stri);
       char *token2 = strtok(stri, " ");
       int idx2 = 0;
-
-      while (token2 != NULL && idx2 < taplen) {
+      while (token2 != NULL && idx2 < taplen_safe) {
           mchannelModeli[idx2] = atof(token2);
           token2 = strtok(NULL, " ");
           idx2++;
@@ -275,17 +273,24 @@ void rxAddInput(const c16_t *input_sig,
     //   timing_array_index = timing_array_index + 1;
     // }
 
-  /* M3: sparse_tap — zero out all but top-K taps by power, then fall through */
+  /* M3: sparse_tap - zero out all but top-K taps by power, then fall through.
+   * lim must NOT exceed MCHAN_MODEL_LEN (the actual stack-array size for
+   * mchannelModel{r,i}); using TT_MAX_TAPS=100 would walk OOB for any
+   * taplen > 20. */
   if (tt_mode == TT_MODE_SPARSE_TAP) {
-      float power[TT_MAX_K];
-      int   top_idx[TT_MAX_K];
-      int   lim = (taplen < TT_MAX_K) ? taplen : TT_MAX_K;
+      float power[MCHAN_MODEL_LEN];
+      int   top_idx[TT_MAX_TOPK];
+      int   lim  = taplen_safe;
+      int   topk = tt_sparse_K;
+      if (topk < 1) topk = 1;
+      if (topk > TT_MAX_TOPK) topk = TT_MAX_TOPK;
+      if (topk > lim) topk = lim;
       for (int k = 0; k < lim; k++)
           power[k] = mchannelModelr[k]*mchannelModelr[k] + mchannelModeli[k]*mchannelModeli[k];
-      tt_select_topk(power, lim, tt_sparse_K, top_idx);
+      tt_select_topk(power, lim, topk, top_idx);
       for (int k = 0; k < lim; k++) {
           int keep = 0;
-          for (int j = 0; j < tt_sparse_K && j < lim; j++)
+          for (int j = 0; j < topk; j++)
               if (top_idx[j] == k) { keep = 1; break; }
           if (!keep) { mchannelModelr[k] = 0.0f; mchannelModeli[k] = 0.0f; }
       }
@@ -517,4 +522,3 @@ out_ptr->i = lround(rx_tmp.i*pathLossLinear + noise_per_sample*gaussZiggurat(0.0
 }
 
 }
-

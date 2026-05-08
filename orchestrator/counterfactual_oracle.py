@@ -6,6 +6,12 @@ OAI+EdgeRIC twin. The oracle injects per-UE scheduling weights via ZMQ into
 each replica's EdgeRIC, reads back per-TTI Metrics protobuf, computes rewards,
 and returns bootstrap confidence intervals on policy improvement over baseline.
 
+Current live semantics are per-rollout fixed-weight candidate evaluation:
+the oracle computes one weight vector from the first fresh in-rollout Metrics
+message, injects it once, and freezes it for the H-TTI horizon. Per-TTI causal
+actions need EdgeRIC-side action_seq / target_tti_seq acknowledgements and are
+intentionally left for the next iteration.
+
 Deployment gate:
     deploy(π_i) iff CI_lower(improvement_i) > 0
                 AND safety_violations == 0
@@ -50,8 +56,21 @@ def compute_reward(
     r_t = Σ_u [ tpt_u  -  λ·bler_proxy_u  -  μ·queue_age_u ]
 
     tpt         : tx_bytes * 8 / 1e6  (Mbps)
-    bler_proxy  : 1 if tx_bytes == 0 else 0  (packet drop indicator)
+    bler_proxy  : 1 if tx_bytes == 0 else 0  (packet-drop indicator)
     queue_age   : dl_buffer / (tx_bytes + 1)
+
+    Note on plan §六 reward formula
+    --------------------------------
+    The plan states ``- λ·BLER_u`` with λ=50, but the EdgeRIC Metrics
+    proto exposed by upstream (see ``proto/metrics.proto``) does not
+    carry a per-UE BLER field — only ``tx_bytes`` and ``dl_buffer``.
+    We substitute a packet-drop indicator (1 if no bytes transmitted in
+    this TTI). For per-UE drops at modest rates the indicator's
+    expectation tracks ``BLER × ack_period`` linearly within a sliding
+    window, so the reward gradient direction is preserved even though
+    the absolute scale differs from the plan's λ=50·BLER. To restore the
+    exact plan formula, add a ``bler`` field to ``UeMetrics`` and
+    populate it on the EdgeRIC producer side.
     """
     total = 0.0
     for ue in metrics.ue_metrics:
@@ -211,6 +230,7 @@ class PolicyVerdict:
     n_rollouts:        int     # alive replicas used
     mean_reward:       float   # raw mean candidate reward
     baseline_mean:     float   # raw mean baseline reward
+    rollout_semantics: str = "fixed_weight"  # current M2 live/mock semantics
 
 
 # ── ZMQ helpers ────────────────────────────────────────────────────────────────
@@ -255,6 +275,7 @@ class CounterfactualOracle:
         mode_selector            = None,   # M3 hook
         seed:             int   = 0,
         mock:             bool  = False,
+        warmup_ttis:      int   = 5,
     ):
         self._host          = twin_host
         self._n_replicas    = n_replicas
@@ -266,6 +287,10 @@ class CounterfactualOracle:
         self._mode_selector = mode_selector
         self._rng           = np.random.default_rng(seed)
         self._mock          = mock
+        # PUB/SUB slow-joiner mitigation: discard this many warmup TTIs after
+        # socket settle so we know the twin's metrics PUB is connected and
+        # producing fresh data before we count rewards.
+        self._warmup_ttis   = warmup_ttis
 
         # Rolling buffer of real-side per-TTI rewards (populated by caller)
         self._baseline_rewards: deque = deque(maxlen=horizon_ttis)
@@ -329,7 +354,11 @@ class CounterfactualOracle:
             alive             = 0
             for res in results:
                 if isinstance(res, Exception):
-                    print(f"[Oracle] Replica error: {res}", flush=True)
+                    # Treat replica timeouts/errors conservatively as a
+                    # safety violation - we did not observe stable behavior
+                    # so we cannot certify the candidate is safe.
+                    print(f"[Oracle] Replica error: {res} (counted as unsafe)", flush=True)
+                    safety_violations += 1
                     continue
                 rewards, max_bler = res
                 if rewards:
@@ -337,6 +366,11 @@ class CounterfactualOracle:
                     alive += 1
                     if max_bler > self._bler_thresh:
                         safety_violations += 1
+                else:
+                    # Replica returned but produced no reward samples -
+                    # also treat as unsafe (PUB/SUB slow-joiner, weight
+                    # injection silently dropped, or twin crash).
+                    safety_violations += 1
 
             elapsed = time.time() - t0
 
@@ -349,13 +383,18 @@ class CounterfactualOracle:
                     deploy=False, n_rollouts=alive,
                     mean_reward=float("nan"),
                     baseline_mean=float(np.mean(baseline_rewards)),
+                    rollout_semantics="fixed_weight",
                 ))
                 print(f"[Oracle] {policy.name}: only {alive} alive replicas — skipped "
                       f"({elapsed:.1f}s)", flush=True)
                 continue
 
+            # Per-evaluate seed so successive evaluate() calls don't replay
+            # the same bootstrap sample sequence (reproducibility hazard
+            # flagged in code review). _eval_count is monotonic per oracle.
             mean_imp, lo, hi = bootstrap_improvement_ci(
-                baseline_rewards, all_rewards, self._B, self._alpha
+                baseline_rewards, all_rewards, self._B, self._alpha,
+                seed=self._eval_count,
             )
             deploy = (lo > 0) and (safety_violations == 0)
 
@@ -368,6 +407,7 @@ class CounterfactualOracle:
                 n_rollouts=alive,
                 mean_reward=float(np.mean(all_rewards)),
                 baseline_mean=float(np.mean(baseline_rewards)),
+                rollout_semantics="fixed_weight",
             )
             verdicts.append(v)
             sign = "✓ DEPLOY" if deploy else "✗ hold"
@@ -389,6 +429,18 @@ class CounterfactualOracle:
         return await self._rollout_live(replica_id, policy)
 
     async def _rollout_live(self, replica_id: int, policy: Policy):
+        """
+        Live rollout on one replica. Semantics: per-rollout fixed weights.
+
+        EdgeRIC's PUB/SUB weight channel has no per-TTI ack, so the previous
+        per-TTI weight injection had no causal guarantee that weights at TTI t
+        actually applied to the reward observed at TTI t (see C2 in the
+        modification plan). We therefore inject the policy's act() output once
+        per rollout — computed from the first in-rollout metrics observation —
+        and freeze it for the whole H-TTI horizon. M2's claim is restated as
+        "rank candidate policies by their initial-weight choice"; design plan
+        §6.2 documents this shift from per-TTI to per-rollout fixed semantics.
+        """
         metrics_port = METRICS_PORT_BASE + 10 * replica_id
         weights_port = WEIGHTS_PORT_BASE + 10 * replica_id
 
@@ -399,10 +451,29 @@ class CounterfactualOracle:
 
         pub = ctx.socket(zmq.PUB)
         pub.connect(f"tcp://{self._host}:{weights_port}")
-        await asyncio.sleep(0.05)   # let ZMQ connections settle
+        await asyncio.sleep(0.1)   # let ZMQ connections settle (slow joiner)
 
-        rewards  = []
-        max_bler = 0.0
+        # Warmup: discard the first few metrics so we know the SUB is hooked
+        # up and the twin EdgeRIC is producing fresh data before counting.
+        last_tti = -1
+        warmup_seen = 0
+        try:
+            while warmup_seen < self._warmup_ttis:
+                try:
+                    raw = await asyncio.wait_for(sub.recv(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    break
+                m_warm = metrics_pb2.Metrics()
+                m_warm.ParseFromString(raw)
+                if int(m_warm.tti_seq) > last_tti:
+                    last_tti = int(m_warm.tti_seq)
+                    warmup_seen += 1
+        except Exception as e:
+            print(f"[Oracle] replica {replica_id} warmup error: {e}", flush=True)
+
+        rewards       = []
+        max_bler      = 0.0
+        weights_sent  = False
         try:
             for _ in range(self._horizon):
                 try:
@@ -414,9 +485,14 @@ class CounterfactualOracle:
                 m = metrics_pb2.Metrics()
                 m.ParseFromString(raw)
 
-                weights = policy.act(m)
-                if weights:
-                    await pub.send(_pack_weights(weights))
+                # Inject weights exactly once. After this point the policy is
+                # frozen for the rollout, and observed rewards reflect that
+                # fixed weight assignment.
+                if not weights_sent:
+                    weights = policy.act(m)
+                    if weights:
+                        await pub.send(_pack_weights(weights))
+                    weights_sent = True
 
                 rewards.append(compute_reward(m))
 

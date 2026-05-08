@@ -76,11 +76,13 @@ class RuleBasedSelector(ModeSelector):
         tau_drift_low:  float = 0.02,
         cqi_var_low:    float = 1.0,
         disagree_high:  float = 0.5,
+        regret_eps:     float = 0.5,
     ):
         self.tau_drift_high = tau_drift_high
         self.tau_drift_low  = tau_drift_low
         self.cqi_var_low    = cqi_var_low
         self.disagree_high  = disagree_high
+        self.regret_eps     = regret_eps
 
     def choose_mode(self, sig: SelectorSignals) -> Mode:
         # Priority 1: any uncertainty / instability → full_iq
@@ -90,8 +92,10 @@ class RuleBasedSelector(ModeSelector):
             return Mode.FULL_IQ
         if sig.policies_disagree > self.disagree_high:
             return Mode.FULL_IQ
-        # High CI width relative to mean improvement → uncertain, escalate
-        if sig.regret_mean != 0 and sig.regret_width > 2 * abs(sig.regret_mean):
+        # Wide CI relative to mean improvement → uncertain, escalate.
+        # eps floor keeps the rule live when regret_mean ≈ 0 (all candidates
+        # equivalent) but CI is still non-trivially wide.
+        if sig.regret_width > max(2 * abs(sig.regret_mean), self.regret_eps):
             return Mode.FULL_IQ
 
         # Priority 2: stable + low drift → mac_only
@@ -187,16 +191,23 @@ def sparsify_topk(r_taps, i_taps, K: int = 4) -> tuple:
 
     Mirrors the C-side logic in apply_channelmod.c (TT_FIDELITY_MODE=sparse_tap)
     so the Python FIFO writer sends pre-sparsified data when mode=sparse_tap.
-    The C side re-sparsifies, but since we pre-zero the weak taps the operation
-    is idempotent and the result is identical to pure-C sparse path.
+
+    Tie-breaking matches the C-side ``tt_select_topk`` which uses
+    argsort and keeps *exactly* K indices: when several taps share the
+    threshold power, we pick the first K by argsort order. Earlier
+    versions used a `power >= threshold` mask which kept all ties and
+    diverged from C when ties were common (low-CQI quantized CIRs).
     """
     r_taps = np.asarray(r_taps, dtype=float)
     i_taps = np.asarray(i_taps, dtype=float)
-    power = r_taps ** 2 + i_taps ** 2
-    if K >= len(power):
+    n = len(r_taps)
+    if K >= n:
         return r_taps.copy(), i_taps.copy()
-    threshold = np.partition(power, -K)[-K]
-    mask = power >= threshold
+    power = r_taps ** 2 + i_taps ** 2
+    # argsort descending; np.argsort is stable so ties resolve by tap index
+    keep = np.argsort(-power, kind="stable")[:K]
+    mask = np.zeros(n, dtype=bool)
+    mask[keep] = True
     return r_taps * mask, i_taps * mask
 
 
@@ -246,6 +257,14 @@ if __name__ == "__main__":
     )
     m = sel.choose_mode(recal)
     assert m == Mode.FULL_IQ, f"Expected FULL_IQ on recent_recalibration, got {m}"
+
+    # regret_mean ≈ 0 but width is large → full_iq via eps floor
+    flat_wide = SelectorSignals(
+        D_t=0.05, cqi_var=2.0, regret_width=10.0, regret_mean=0.0,
+        policies_disagree=0.1, recent_recalibration=False, rnti_count=2,
+    )
+    m = sel.choose_mode(flat_wide)
+    assert m == Mode.FULL_IQ, f"Expected FULL_IQ on flat-but-wide regret, got {m}"
 
     # sparsify_topk: only top-2 taps survive
     r = np.array([0.1, 0.9, 0.0, 0.5])

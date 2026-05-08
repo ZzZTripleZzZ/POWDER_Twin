@@ -56,9 +56,14 @@ _CQI_TO_SNR_DB = {
 
 
 def cqi_to_snr_db(cqi: int) -> float:
-    # OAI logs SNR*8 (Q8 fixed-point) when the raw value exceeds 3GPP CQI range 0-15
+    # Two parsing modes for snr.txt's "UL CQI: <n>" line:
+    #   - n in [0,15]: real 5G NR CQI (post-B-patch builds; gNB_scheduler_ulsch.c
+    #     maps pusch_snrx10 → 0..15 before logging).
+    #   - n > 15: legacy / pre-B-patch builds wrote OAI's raw 8-bit ul_cqi where
+    #     pusch_snrx10 = ul_cqi*5 - 640, i.e. SNR_dB = (ul_cqi - 128) / 2.
+    #     Empirically: ul_cqi=184 ↔ pusch_snrx10=280 ↔ SNR=28 dB.
     if cqi > 15:
-        return cqi / 8.0
+        return (cqi - 128) / 2.0
     return _CQI_TO_SNR_DB.get(max(0, min(15, cqi)), 0.0)
 
 
@@ -257,13 +262,19 @@ class ChannelCalibrator:
         return self._trigger_count
 
     def _drift_cqi_bin(self, cqi: int) -> int:
-        """Coarse CQI bin for drift histogram. Handles raw CQI and OAI Q8 SNR."""
-        if cqi > 15:           # OAI Q8 fixed-point SNR encoding
-            snr = cqi / 8.0
-            if snr < 0:   return 0
-            if snr < 10:  return 1
-            if snr < 20:  return 2
-            return 3
+        """Coarse CQI bin for drift histogram.
+
+        Both `real_cqi` and `twin_cqi` are normalized to the [0, 15] CQI
+        scale before reaching here (see `state_sync._maybe_drift_observe`,
+        which wraps OAI Q8 SNR through `snr_db_to_cqi`). The legacy
+        `cqi > 15` branch is kept as a defensive fallback so that callers
+        passing raw Q8 values still produce a bin on the *same* SNR-derived
+        axis as the post-conversion path — otherwise the real and twin
+        marginals would land on different bin scales and KL becomes meaningless.
+        """
+        if cqi > 15:
+            snr_db = cqi / 8.0
+            cqi = max(0, min(15, int(round(snr_db_to_cqi(snr_db)))))
         return min(int(cqi) // 4, self.DRIFT_NUM_CQI_BINS - 1)
 
     def _drift_bler_bin(self, bler: float) -> int:
@@ -407,6 +418,36 @@ def stream_cir_to_pipe(
             fi.write(" ".join(f"{v:.6f}" for v in i) + "\n")
 
 
+# ── POWDER trace helper ───────────────────────────────────────────────────────
+
+def load_powder_trace(
+    scenario: str = "pedestrian",
+    *,
+    csv_path=None,
+    duration_s: float = 300.0,
+    seed: int = 42,
+    out_dir=None,
+):
+    """Return Path to a POWDER-calibrated CIR file.
+
+    If csv_path is given, converts a POWDER RSSI measurement CSV to a CIR file
+    (gen_from_measurement).  Otherwise generates a synthetic trace from the
+    Ericsson+Jakes model (gen_from_model).
+
+    This is the single entry point for state_sync.py and eval scripts that need
+    a POWDER-calibrated channel file rather than the static channel_clean.txt.
+
+    Examples:
+        load_powder_trace("drift_ped2veh")
+        load_powder_trace(csv_path="/tmp/rssi_20260504.csv")
+    """
+    from .powder_cir_gen import gen_from_measurement, gen_from_model
+
+    if csv_path is not None:
+        return gen_from_measurement(csv_path, duration_s=duration_s, out_dir=out_dir)
+    return gen_from_model(scenario, duration_s=duration_s, seed=seed, out_dir=out_dir)
+
+
 if __name__ == "__main__":
     import sys
 
@@ -423,17 +464,18 @@ if __name__ == "__main__":
         cal = ChannelCalibrator()
         rng = np.random.default_rng(42)
 
-        # Simulate: real CQI 184 -> 23 dB, but twin measures 20 dB -> calibrator should
-        # learn to upscale by +3 dB (amplitude *= 10^(3/20) = 1.413)
+        # Simulate: real ul_cqi 184 -> 28 dB (per OAI's pusch_snrx10=ul_cqi*5-640
+        # encoding), but twin measures 20 dB -> calibrator should learn to upscale
+        # by +8 dB (amplitude *= 10^(8/20) ≈ 2.512).
         for _ in range(20):
             cal.update(real_cqi=184, twin_snr_db=20.0)
         print(cal.summary())
         scale = cal.amplitude_scale(184)
-        print(f"  amplitude_scale(184) = {scale:.4f}  (expect ~{10**(3/20):.4f})")
+        print(f"  amplitude_scale(184) = {scale:.4f}  (expect ~{10**(8/20):.4f})")
 
         # Generate uncalibrated vs calibrated CIR and check power
-        r_raw, i_raw = snr_db_to_cir(23.0, rng=rng, amplitude_scale=1.0)
-        r_cal, i_cal = snr_db_to_cir(23.0, rng=rng, amplitude_scale=scale)
+        r_raw, i_raw = snr_db_to_cir(28.0, rng=rng, amplitude_scale=1.0)
+        r_cal, i_cal = snr_db_to_cir(28.0, rng=rng, amplitude_scale=scale)
         power_raw = sum(x**2 + y**2 for x, y in zip(r_raw, i_raw))
         power_cal = sum(x**2 + y**2 for x, y in zip(r_cal, i_cal))
         print(f"  raw total power = {power_raw:.4f}")
@@ -479,3 +521,10 @@ if __name__ == "__main__":
         print(f"  trigger_count={cal2.trigger_count()}, "
               f"coh_samples after 1 obs={cal2.coherence_samples()}")
         print("  M1 smoke test passed.")
+
+        # ── cqi_to_snr_db formula sanity ─────────────────────────────────────
+        # Pre-B-patch path: ul_cqi=184 (raw 8-bit) ↔ SNR=28 dB.
+        # Post-B-patch path: ul_cqi=7 (real 5G CQI) ↔ SNR=7 dB (TS 38.214 anchor).
+        assert abs(cqi_to_snr_db(184) - 28.0) < 0.5, cqi_to_snr_db(184)
+        assert abs(cqi_to_snr_db(7)   -  7.0) < 0.5, cqi_to_snr_db(7)
+        print("  cqi_to_snr_db formula sanity passed (184→28 dB, 7→7 dB).")

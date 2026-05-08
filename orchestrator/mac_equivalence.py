@@ -14,7 +14,10 @@ where:
   T_TTI = 1 ms (5G NR numerology 0)
 
 The claim scopes to the orchestrator's metrics-layer view (protobuf data
-forwarded by layer2_mac_sync), not OAI's internal C structures.
+forwarded by layer2_mac_sync), not OAI's internal C structures. If the
+EdgeRIC producer does not populate HARQ/BSR/queue-age fields, M4 verifies only
+the schema-visible metrics state available in that stream; it must not be read
+as full internal MAC-state equivalence until those fields are filled by OAI.
 
 Protocol:
   Real side — MacReconciler: bind REP on port 5560; on each recv:
@@ -53,6 +56,9 @@ def hash_ue_state(ue: metrics_pb2.UeMetrics) -> bytes:
 
     Uses only fields that matter for scheduler decisions and HARQ correctness:
     rnti, cqi, harq_state vector, bsr_kbytes, scheduler_queue_age.
+    In local/mock or older EdgeRIC builds, harq_state/bsr/queue_age may be
+    absent/default-zero; then the hash truthfully covers only the populated
+    metrics-schema fields, not hidden OAI scheduler internals.
     """
     h = hashlib.sha256()
     h.update(ue.rnti.to_bytes(4, "little"))
@@ -95,9 +101,16 @@ class ReconcileStats:
     last_wall_clock_us: int = 0
 
     def empirical_delta_p99(self) -> float:
+        """p99 of |Δ| — matches the M4 bound which is on per-UE skew magnitude."""
         if not self.delta_history:
             return 0.0
-        return float(np.percentile(self.delta_history, 99))
+        return float(np.percentile(np.abs(self.delta_history), 99))
+
+    def signed_delta_minmax(self) -> tuple:
+        """(min, max) of signed Δ — exposes twin-ahead races for diagnostics."""
+        if not self.delta_history:
+            return (0, 0)
+        return (int(np.min(self.delta_history)), int(np.max(self.delta_history)))
 
     def mean_rtt_ms(self) -> float:
         if not self.rtt_history_ms:
@@ -109,7 +122,8 @@ class ReconcileStats:
             f"epochs={self.epochs} matched={self.matches} "
             f"mismatched={self.mismatches} "
             f"p99Δ={self.empirical_delta_p99():.0f}TTI "
-            f"mean_rtt={self.mean_rtt_ms():.1f}ms"
+            f"mean_rtt={self.mean_rtt_ms():.1f}ms "
+            f"scope=metrics-schema"
         )
 
 
@@ -131,14 +145,32 @@ class MacReconciler:
         self._latest: Optional[metrics_pb2.Metrics] = None
         self._epoch  = 0
         self.stats   = ReconcileStats()
+        # Pre-built mismatch response template; rebuilt in update() so serve_one
+        # only needs to patch epoch/wall_clock_us and re-serialize. Keeps the
+        # full_state UeState population out of the layer2_mac_sync hot loop.
+        self._mismatch_template: Optional[reconciliation_pb2.ReconciliationResponse] = None
 
     @property
     def epoch(self) -> int:
         return self._epoch
 
     def update(self, metrics: metrics_pb2.Metrics) -> None:
-        """Called from layer2_mac_sync after stamp_metrics(); stores reference."""
+        """Called from layer2_mac_sync after stamp_metrics(); stores reference
+        and refreshes the mismatch response template."""
         self._latest = metrics
+        tmpl = reconciliation_pb2.ReconciliationResponse()
+        tmpl.hash_matched     = False
+        tmpl.real_tti_seq     = metrics.tti_seq
+        tmpl.real_global_hash = metrics.global_state_hash
+        for ue in metrics.ue_metrics:
+            us = tmpl.full_state.add()
+            us.rnti                = ue.rnti
+            us.cqi                 = ue.cqi
+            us.harq_state[:]       = list(ue.harq_state)
+            us.scheduler_queue_age = ue.scheduler_queue_age
+            us.bsr_kbytes          = ue.bsr_kbytes
+            us.ue_state_hash       = ue.ue_state_hash
+        self._mismatch_template = tmpl
 
     def serve_one(self) -> bool:
         """Serve at most one reconciliation request. Non-blocking; returns True if served."""
@@ -152,36 +184,40 @@ class MacReconciler:
         req = reconciliation_pb2.ReconciliationRequest()
         req.ParseFromString(raw)
 
-        resp = reconciliation_pb2.ReconciliationResponse()
-        resp.reconcile_epoch = self._epoch
-        resp.wall_clock_us   = int(time.time() * 1e6)
-
         if self._latest is None:
-            resp.hash_matched = False
+            resp = reconciliation_pb2.ReconciliationResponse()
+            resp.hash_matched    = False
+            resp.reconcile_epoch = self._epoch
+            resp.wall_clock_us   = int(time.time() * 1e6)
+            payload  = resp.SerializeToString()
+            matched  = False
         elif req.twin_global_hash == self._latest.global_state_hash:
+            resp = reconciliation_pb2.ReconciliationResponse()
             resp.hash_matched     = True
             resp.real_tti_seq     = self._latest.tti_seq
             resp.real_global_hash = self._latest.global_state_hash
+            resp.reconcile_epoch  = self._epoch
+            resp.wall_clock_us    = int(time.time() * 1e6)
+            payload  = resp.SerializeToString()
+            matched  = True
         else:
-            resp.hash_matched     = False
-            resp.real_tti_seq     = self._latest.tti_seq
-            resp.real_global_hash = self._latest.global_state_hash
-            # Encode full UE state into UeState submessages
-            for ue in self._latest.ue_metrics:
-                us = resp.full_state.add()
-                us.rnti                = ue.rnti
-                us.cqi                 = ue.cqi
-                us.harq_state[:]       = list(ue.harq_state)
-                us.scheduler_queue_age = ue.scheduler_queue_age
-                us.bsr_kbytes          = ue.bsr_kbytes
-                us.ue_state_hash       = ue.ue_state_hash
             self._epoch += 1
-            resp.reconcile_epoch = self._epoch
+            tmpl = self._mismatch_template
+            tmpl.reconcile_epoch = self._epoch
+            tmpl.wall_clock_us   = int(time.time() * 1e6)
+            # Refresh real_tti_seq / real_global_hash from the *current*
+            # latest snapshot — without this, the response could carry a
+            # tti_seq that lags by up to one update() cycle, biasing the
+            # measured Δ in E5.
+            tmpl.real_tti_seq     = self._latest.tti_seq
+            tmpl.real_global_hash = self._latest.global_state_hash
+            payload  = tmpl.SerializeToString()
+            matched  = False
 
-        self._rep.send(resp.SerializeToString())
+        self._rep.send(payload)
 
         self.stats.epochs += 1
-        if resp.hash_matched:
+        if matched:
             self.stats.matches += 1
         else:
             self.stats.mismatches += 1
@@ -208,21 +244,36 @@ class MacReconcilerClient:
         real_endpoint:  str   = "tcp://powder-gnb:5560",
         timeout_ms:     int   = 500,
     ):
-        ctx = zmq.Context.instance()
-        self._req = ctx.socket(zmq.REQ)
-        self._req.connect(real_endpoint)
-        self._req.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        self._ctx = zmq.Context.instance()
+        self._endpoint = real_endpoint
+        self._timeout_ms = timeout_ms
+        self._req = self._new_req_socket()
         self.stats = ReconcileStats()
+
+    def _new_req_socket(self):
+        req = self._ctx.socket(zmq.REQ)
+        req.setsockopt(zmq.LINGER, 0)
+        req.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
+        req.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
+        req.connect(self._endpoint)
+        return req
+
+    def _reset_req_socket(self) -> None:
+        try:
+            self._req.close(linger=0)
+        except Exception:
+            pass
+        self._req = self._new_req_socket()
 
     def reconcile(
         self,
         twin_state: metrics_pb2.Metrics,
-    ) -> Optional[int]:
+    ) -> Optional[tuple[bool, int]]:
         """Send reconciliation request; apply diff on mismatch.
 
         Returns:
-          0    — hash matched, twin view in sync
-          > 0  — Δ (TTIs) on mismatch; twin_state mutated with real full_state
+          (True, 0)    — hash matched, twin view in sync
+          (False, Δ)   — hash mismatch; twin_state mutated with real full_state
           None — timeout or ZMQ error
         """
         sent_us = int(time.time() * 1e6)
@@ -232,13 +283,19 @@ class MacReconcilerClient:
             reconcile_epoch  = twin_state.reconcile_epoch,
             wall_clock_us    = sent_us,
         )
-        self._req.send(req.SerializeToString())
+        try:
+            self._req.send(req.SerializeToString())
+        except zmq.ZMQError:
+            self._reset_req_socket()
+            return None
 
         try:
             raw = self._req.recv()
         except zmq.Again:
+            self._reset_req_socket()
             return None
         except zmq.ZMQError:
+            self._reset_req_socket()
             return None
 
         recv_us = int(time.time() * 1e6)
@@ -251,11 +308,13 @@ class MacReconcilerClient:
 
         if resp.hash_matched:
             self.stats.matches += 1
-            return 0
+            return (True, 0)
 
-        # Apply real-side diff to twin orchestrator's local view
+        # Apply real-side diff to twin orchestrator's local view.
+        # Signed delta: negative values surface twin-ahead races (e.g. real
+        # pushed a stale Metrics after twin already advanced). Recording the
+        # raw value lets E5 distinguish protocol skew from clock drift.
         delta = int(resp.real_tti_seq) - int(twin_state.tti_seq)
-        delta = max(delta, 0)
 
         # Update twin metrics-layer view from real full_state
         del twin_state.ue_metrics[:]
@@ -274,7 +333,7 @@ class MacReconcilerClient:
 
         self.stats.mismatches += 1
         self.stats.delta_history.append(delta)
-        return delta
+        return (False, delta)
 
 
 # ── Theorem instantiation helper ──────────────────────────────────────────────
