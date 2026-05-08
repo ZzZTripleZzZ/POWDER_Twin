@@ -1,0 +1,33 @@
+# Standalone compose for real OTA gNB — does NOT overlay docker-compose.twin.yaml.
+# network_mode: host lets the container reach both:
+#   - X310 at 192.168.1.10 (ctrl-lan Ethernet)
+#   - OAI CN AMF at 192.168.70.133 (tt-public-net bridge visible from host)
+#
+# Usage (on gnb-real, after CN is up):
+#   cd ~/Tiny_Twin/sims
+#   sudo docker compose -f docker-compose.real-ota-standalone.yaml up -d tt-gnb
+
+services:
+  tt-gnb:
+    image: tt-gnb:v2
+    container_name: tt-gnb
+    privileged: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host
+    volumes:
+      - ../logs:/tt-ran/logs
+      - /tmp:/tmp:rw
+      - ../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf:/tt-ran/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf:ro
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        mkdir -p /tt-ran/logs &&
+        cd /tt-ran/cmake_targets/ran_build/build/ &&
+        exec ./nr-softmodem
+        -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+        --sa
