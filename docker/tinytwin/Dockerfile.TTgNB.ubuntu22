@@ -172,6 +172,10 @@ RUN apt-get update && \
 # Patch OAI build_helper for Ubuntu 24.04: python-tk -> python3-tk (no longer in noble repos)
 RUN sed -i 's/python-tk/python3-tk/g' cmake_targets/tools/build_helper
 
+# Tell CMake exactly where libuhd-dev's config files live. The earlier
+# `ENV CMAKE_PREFIX_PATH=/usr/include/yaml-cpp` overrode the system search,
+# so find_package(UHD) failed even though /usr/lib/x86_64-linux-gnu/cmake/uhd/
+# contains UHDConfig.cmake.
 RUN /bin/sh oaienv && \
     cd cmake_targets && \
     mkdir -p log && \
@@ -180,6 +184,8 @@ RUN /bin/sh oaienv && \
         --gNB --nrUE \
         --build-lib "telnetsrv enbscope uescope nrscope" \
         --cmake-opt -DXAPP_MULTILANGUAGE=OFF --cmake-opt -DKPM_VERSION=$KPM_VERSION --cmake-opt -DE2AP_VERSION=$E2AP_VERSION \
+        --cmake-opt -DUHD_DIR=/usr/lib/x86_64-linux-gnu/cmake/uhd \
+        --cmake-opt -DCMAKE_PREFIX_PATH=/usr:/usr/local:/usr/include/yaml-cpp \
         --cmake-opt -DCMAKE_C_FLAGS="-w" --cmake-opt -DCMAKE_CXX_FLAGS="-w" $BUILD_OPTION && \
     ln -sf /usr/local/lib/liboai_usrpdevif.so /usr/local/lib/liboai_device.so && \
     ldconfig && \
