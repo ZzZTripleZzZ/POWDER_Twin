@@ -210,7 +210,18 @@ RUN mkdir -p /usr/lib/cmake/UHD /opt/uhd-include && \
 # the standard single-argument REQUIRED form.
 RUN sed -i 's/find_package(UHD REQUIRED UHD)/find_package(UHD REQUIRED)/g' \
         radio/USRP/CMakeLists.txt && \
-    grep "find_package(UHD" radio/USRP/CMakeLists.txt
+    grep "find_package(UHD" radio/USRP/CMakeLists.txt && \
+    \
+    # Hardcode the include path on the oai_usrpdevif target. CMake's \
+    # target_include_directories silently filters paths that match the \
+    # compiler's implicit system search list - even our /opt/uhd-include \
+    # staging didn't survive somehow. Append a literal hardcoded path \
+    # via target_compile_options(... -I...) which CMake passes through \
+    # untouched. \
+    grep -q '/opt/uhd-include' radio/USRP/CMakeLists.txt || \
+    sed -i '/^target_include_directories(oai_usrpdevif/a\target_compile_options(oai_usrpdevif PRIVATE -I/opt/uhd-include)' \
+        radio/USRP/CMakeLists.txt && \
+    grep -E 'target_(include_directories|compile_options).*oai_usrpdevif' radio/USRP/CMakeLists.txt
 
 # WORKDIR /opt/oai-gnb/bin
 # COPY --from=gnb-build \
