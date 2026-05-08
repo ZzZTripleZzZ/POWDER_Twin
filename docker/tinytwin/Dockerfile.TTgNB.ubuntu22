@@ -154,15 +154,26 @@ RUN apt-get update && \
     apt-get clean -y && \
     rm -rf /var/lib/apt/lists/*
 
-# Symlink libuhd-dev's CMake config into the default CMAKE_MODULE_PATH /
-# CMAKE_PREFIX_PATH search location. CMake searches /usr/lib/cmake/<Pkg>/
-# and /usr/local/lib/cmake/<Pkg>/ unconditionally; libuhd-dev installs to
-# /usr/lib/x86_64-linux-gnu/cmake/uhd/ which is only searched by newer
-# CMake versions and only when CMAKE_PREFIX_PATH is right. OAI's build_oai
-# strips/overrides CMAKE_PREFIX_PATH so we use a symlink instead.
-RUN mkdir -p /usr/lib/cmake/UHD && \
-    cp -a /usr/lib/x86_64-linux-gnu/cmake/uhd/. /usr/lib/cmake/UHD/ && \
-    ls /usr/lib/cmake/UHD/
+# Make libuhd-dev's CMake config visible to find_package(UHD).
+# CMake searches /usr/lib/cmake/<Pkg>/ unconditionally, but libuhd-dev
+# installs into /usr/lib/x86_64-linux-gnu/cmake/uhd/ (only searched when
+# CMAKE_PREFIX_PATH is right; OAI's build_oai strips that env). We use a
+# DIRECTORY SYMLINK rather than copy so UHDConfig.cmake's relative-path
+# math (`${CMAKE_CURRENT_LIST_DIR}/../../...`) resolves to the original
+# /usr install prefix instead of breaking with an "incorrect number of
+# arguments" error.
+RUN mkdir -p /usr/lib/cmake && \
+    ln -sfn /usr/lib/x86_64-linux-gnu/cmake/uhd /usr/lib/cmake/UHD && \
+    ls -la /usr/lib/cmake/UHD/
+
+# Patch OAI's USRP CMakeLists.txt: the original `find_package(UHD REQUIRED UHD)`
+# treats the trailing 'UHD' as a required component, which trips UHDConfig.cmake
+# internal validator with "get_filename_component called with incorrect number
+# of arguments" (line 90). Drop the redundant component so find_package uses
+# the standard single-argument REQUIRED form.
+RUN sed -i 's/find_package(UHD REQUIRED UHD)/find_package(UHD REQUIRED)/g' \
+        radio/USRP/CMakeLists.txt && \
+    grep "find_package(UHD" radio/USRP/CMakeLists.txt
 
 # WORKDIR /opt/oai-gnb/bin
 # COPY --from=gnb-build \
