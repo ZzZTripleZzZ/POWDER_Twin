@@ -90,8 +90,13 @@ RUN apt-get install -y libgtest-dev
 RUN apt-get install -y libzmq3-dev
 RUN apt-get install -y protobuf-compiler libprotobuf-dev
     
-ENV CMAKE_PREFIX_PATH=/usr/include/yaml-cpp
-    
+# CMAKE_PREFIX_PATH must include /usr so find_package(UHD) locates
+# UHDConfig.cmake at /usr/lib/x86_64-linux-gnu/cmake/uhd/. The original
+# /usr/include/yaml-cpp-only value masked the system search and caused
+# OAI's radio/USRP/CMakeLists.txt:2 find_package(UHD) to fail even with
+# libuhd-dev installed.
+ENV CMAKE_PREFIX_PATH=/usr:/usr/local:/usr/include/yaml-cpp
+
 # build all targets so final targets can be created afterwards
 # RUN /bin/sh oaienv && \
 #     cd cmake_targets && \
@@ -172,10 +177,10 @@ RUN apt-get update && \
 # Patch OAI build_helper for Ubuntu 24.04: python-tk -> python3-tk (no longer in noble repos)
 RUN sed -i 's/python-tk/python3-tk/g' cmake_targets/tools/build_helper
 
-# Tell CMake exactly where libuhd-dev's config files live. The earlier
-# `ENV CMAKE_PREFIX_PATH=/usr/include/yaml-cpp` overrode the system search,
-# so find_package(UHD) failed even though /usr/lib/x86_64-linux-gnu/cmake/uhd/
-# contains UHDConfig.cmake.
+# find_package(UHD) is satisfied by ENV CMAKE_PREFIX_PATH=/usr (set above)
+# pointing CMake at /usr/lib/x86_64-linux-gnu/cmake/uhd/UHDConfig.cmake from
+# libuhd-dev. --cmake-opt was unreliable because OAI's build_oai performs
+# multiple cmake invocations and only the last received the override.
 RUN /bin/sh oaienv && \
     cd cmake_targets && \
     mkdir -p log && \
@@ -184,8 +189,6 @@ RUN /bin/sh oaienv && \
         --gNB --nrUE \
         --build-lib "telnetsrv enbscope uescope nrscope" \
         --cmake-opt -DXAPP_MULTILANGUAGE=OFF --cmake-opt -DKPM_VERSION=$KPM_VERSION --cmake-opt -DE2AP_VERSION=$E2AP_VERSION \
-        --cmake-opt -DUHD_DIR=/usr/lib/x86_64-linux-gnu/cmake/uhd \
-        --cmake-opt -DCMAKE_PREFIX_PATH=/usr:/usr/local:/usr/include/yaml-cpp \
         --cmake-opt -DCMAKE_C_FLAGS="-w" --cmake-opt -DCMAKE_CXX_FLAGS="-w" $BUILD_OPTION && \
     ln -sf /usr/local/lib/liboai_usrpdevif.so /usr/local/lib/liboai_device.so && \
     ldconfig && \
