@@ -154,6 +154,16 @@ RUN apt-get update && \
     apt-get clean -y && \
     rm -rf /var/lib/apt/lists/*
 
+# Symlink libuhd-dev's CMake config into the default CMAKE_MODULE_PATH /
+# CMAKE_PREFIX_PATH search location. CMake searches /usr/lib/cmake/<Pkg>/
+# and /usr/local/lib/cmake/<Pkg>/ unconditionally; libuhd-dev installs to
+# /usr/lib/x86_64-linux-gnu/cmake/uhd/ which is only searched by newer
+# CMake versions and only when CMAKE_PREFIX_PATH is right. OAI's build_oai
+# strips/overrides CMAKE_PREFIX_PATH so we use a symlink instead.
+RUN mkdir -p /usr/lib/cmake/UHD && \
+    cp -a /usr/lib/x86_64-linux-gnu/cmake/uhd/. /usr/lib/cmake/UHD/ && \
+    ls /usr/lib/cmake/UHD/
+
 # WORKDIR /opt/oai-gnb/bin
 # COPY --from=gnb-build \
 #     /oai-ran/cmake_targets/ran_build/build/nr-softmodem ./
