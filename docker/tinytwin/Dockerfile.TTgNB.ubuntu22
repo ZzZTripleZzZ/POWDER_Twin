@@ -272,7 +272,7 @@ RUN /bin/sh oaienv && \
         --gNB --nrUE \
         --build-lib "telnetsrv enbscope uescope nrscope" \
         --cmake-opt -DXAPP_MULTILANGUAGE=OFF --cmake-opt -DKPM_VERSION=$KPM_VERSION --cmake-opt -DE2AP_VERSION=$E2AP_VERSION \
-        --cmake-opt -DCMAKE_C_FLAGS="-w" --cmake-opt -DCMAKE_CXX_FLAGS="-w" $BUILD_OPTION && \
+        --cmake-opt -DCMAKE_C_FLAGS="-w -I/opt/uhd-include" --cmake-opt -DCMAKE_CXX_FLAGS="-w -I/opt/uhd-include" $BUILD_OPTION && \
     ln -sf /usr/local/lib/liboai_usrpdevif.so /usr/local/lib/liboai_device.so && \
     ldconfig && \
     echo "---- ldd on executables ----" && \
