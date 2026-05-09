@@ -184,17 +184,23 @@ async def _ssh_bg(host: str, cmd: str, log: str) -> None:
 async def check_connectivity(gnb: str, twin: str, ue_hosts: list[str]) -> bool:
     print("\n=== Phase 0: Connectivity ===", flush=True)
     ok = True
+    # Use the ctrl-lan IP (enp4s0f1, 192.168.1.0/24) rather than the public
+    # eno1 IP for ZMQ peering. EdgeRIC binds its publisher to a private
+    # tt-public-net IP (192.168.70.140) which is unreachable across hosts;
+    # connecting via ctrl-lan + a host-local DNAT keeps everything inside
+    # the experiment's L2 fabric. The twin reaches the gNB metrics PUB at
+    # gnb-real's ctrl-lan IP (192.168.1.1) which we DNAT to 192.168.70.140.
     for host, label in [(gnb, "gnb-real"), (twin, "twin")] + [(u, u) for u in ue_hosts]:
         try:
             out = await _ssh(
                 host,
                 "hostname && "
-                "ip addr show eno1 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1",
+                "ip addr show enp4s0f1 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d/ -f1",
             )
             lines = out.strip().split("\n")
             if len(lines) >= 2 and lines[1].count(".") == 3:
                 _node_ip[host] = lines[1]
-            print(f"  [OK] {label} ({host}) → {lines[0]}", flush=True)
+            print(f"  [OK] {label} ({host}) -> {lines[0]} (ctrl-lan {_node_ip.get(host)})", flush=True)
         except Exception as e:
             print(f"  [FAIL] Cannot reach {label} ({host}): {e}", flush=True)
             ok = False
@@ -254,17 +260,26 @@ async def start_real_gnb(gnb: str, quick: bool = False) -> None:
         "down tt-gnb 2>/dev/null || true",
         check=False)
 
-    # Probe candidate X310s on ctrl-lan and pick the first that responds to
-    # uhd_find_devices. The POWDER profile allocates ota-x310-2/-3/-4; ota-x310-1
-    # was confirmed dead 2026-05-08.
+    # EdgeRIC publisher in tt-gnb hardcodes bind("tcp://192.168.70.140:5555")
+    # in executables/edgeric/edgeric.cpp. With network_mode:host the container
+    # shares gnb-real's net namespace, but tt-public-net's default IP is
+    # 192.168.70.129 (the bridge gateway) - .140 is NOT auto-assigned, so the
+    # ZMQ bind would fail with EADDRNOTAVAIL and the gNB would never publish
+    # metrics. Add .140 as a secondary IP on the bridge so the bind succeeds
+    # regardless. NG-AMF SCTP keeps using .129 from the gnb conf.
+    await _ssh(gnb,
+        "sudo ip addr add 192.168.70.140/26 dev tt-public-net 2>/dev/null || true",
+        check=False)
+
+    # Probe X310 (single candidate at 192.168.40.2 on the dedicated radio-link).
     x310_ip = await _select_live_x310(gnb)
     print(f"[gNB] Selected X310 at {x310_ip}", flush=True)
 
-    # Patch the X310 ctrl-lan IP into the host-side conf. The compose file
-    # bind-mounts this exact path into the container, so the patch takes
-    # effect without rebuilding the image.
+    # Patch the X310 IP into the host-side conf. The compose file bind-mounts
+    # this exact path into the container, so the patch takes effect without
+    # rebuilding the image.
     await _ssh(gnb,
-        r"GNB_CONF=~/Tiny_Twin/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.24PRB.usrpx310.dt-ota.conf && "
+        r"GNB_CONF=~/Tiny_Twin/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.51PRB.usrpx310.dt-ota.conf && "
         rf"sudo sed -i 's|sdr_addrs[[:space:]]*=[[:space:]]*\"addr=[^\"]*\"|sdr_addrs = \"addr={x310_ip}\"|g' \"$GNB_CONF\" && "
         rf"grep sdr_addrs \"$GNB_CONF\"",
         check=True)

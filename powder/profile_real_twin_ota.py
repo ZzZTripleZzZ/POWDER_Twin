@@ -242,12 +242,12 @@ NUC_STARTUP      = _b64_wrap(_NUC_INNER)
 
 gnb_real = request.RawPC("gnb-real")
 gnb_real.hardware_type = "d430"
-gnb_real.disk_image = "urn:publicid:IDN+emulab.net+image+emulab-ops:UBUNTU22-64-STD"
+gnb_real.disk_image = "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD"
 gnb_real.addService(pg.Execute(shell="bash", command=GNB_REAL_STARTUP))
 
 twin = request.RawPC("twin")
 twin.hardware_type = "d430"
-twin.disk_image = "urn:publicid:IDN+emulab.net+image+emulab-ops:UBUNTU22-64-STD"
+twin.disk_image = "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD"
 twin.addService(pg.Execute(shell="bash", command=TWIN_STARTUP))
 
 # -- X310 paired with gnb-real via dedicated 10G fiber radio-link -----------
@@ -278,7 +278,9 @@ for name, component_id in NUC_FIXED_NODES.items():
     n.component_id = component_id
     n.component_manager_id = EMULAB_CM
     n.addService(pg.Execute(shell="bash", command=NUC_STARTUP))
-    n.requestSpectrum(freq_low, freq_high, max_power)
+    # NOTE: do not requestSpectrum on NUCs - the COTS Quectel modems use
+    # CBRS spectrum granted through the carrier's APN registration, not
+    # POWDER spectrum reservations. Only the gNB-side X310 needs the band.
     ue_nodes[name] = n
 
 # -- Control LAN: gnb-real + twin + ue-nucs (no X310) -----------------------

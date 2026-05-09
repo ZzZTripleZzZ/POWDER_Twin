@@ -246,6 +246,20 @@ RUN sed -i 's/find_package(UHD REQUIRED UHD)/find_package(UHD REQUIRED)/g' \
 # Patch OAI build_helper for Ubuntu 24.04: python-tk -> python3-tk (no longer in noble repos)
 RUN sed -i 's/python-tk/python3-tk/g' cmake_targets/tools/build_helper
 
+# Patch EdgeRIC's hardcoded ZMQ publisher bind address. The C++ source binds
+# to tcp://192.168.70.140:5555 unconditionally; in docker bridge mode (twin)
+# the container has .140 statically assigned and the bind succeeds, but in
+# network_mode: host (gnb-real OTA), .140 is added as a host alias by
+# real_twin_eval.py, AND the bind here must accept the host's other
+# interfaces too so the twin can subscribe via gnb-real's ctrl-lan IP.
+# Replace 192.168.70.140 with 0.0.0.0 so ZMQ listens on all interfaces.
+RUN if [ -f executables/edgeric/edgeric.cpp ]; then \
+      sed -i 's|tcp://192.168.70.140:5555|tcp://0.0.0.0:5555|g' executables/edgeric/edgeric.cpp && \
+      grep -E 'publisher\.bind|0\.0\.0\.0:5555' executables/edgeric/edgeric.cpp | head -3; \
+    else \
+      echo "(no executables/edgeric/edgeric.cpp - skipping bind patch)"; \
+    fi
+
 # find_package(UHD) is satisfied by ENV CMAKE_PREFIX_PATH=/usr (set above)
 # pointing CMake at /usr/lib/x86_64-linux-gnu/cmake/uhd/UHDConfig.cmake from
 # libuhd-dev. --cmake-opt was unreliable because OAI's build_oai performs
@@ -262,7 +276,7 @@ RUN /bin/sh oaienv && \
     ln -sf /usr/local/lib/liboai_usrpdevif.so /usr/local/lib/liboai_device.so && \
     ldconfig && \
     echo "---- ldd on executables ----" && \
-    ldd ran_build/build/*softmodem* ran_build/build/nr-cuup && \
+    ldd ran_build/build/*softmodem* && \
     echo "---- ldd on shared libraries ----" && \
     ldd ran_build/build/*.so
 WORKDIR /opt/tt-ran/tt

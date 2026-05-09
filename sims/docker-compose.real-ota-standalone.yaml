@@ -27,7 +27,7 @@ services:
     volumes:
       - ../logs:/tt-ran/logs
       - /tmp:/tmp:rw
-      - ../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.24PRB.usrpx310.dt-ota.conf:/tt-ran/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.24PRB.usrpx310.dt-ota.conf:ro
+      - ../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.51PRB.usrpx310.dt-ota.conf:/tt-ran/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.51PRB.usrpx310.dt-ota.conf:ro
     entrypoint:
       - /bin/bash
       - -c
@@ -35,5 +35,5 @@ services:
         mkdir -p /tt-ran/logs &&
         cd /tt-ran/cmake_targets/ran_build/build/ &&
         exec ./nr-softmodem
-        -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.24PRB.usrpx310.dt-ota.conf
+        -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.51PRB.usrpx310.dt-ota.conf
         --sa
