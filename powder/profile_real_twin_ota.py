@@ -2,27 +2,39 @@
 """
 POWDER Profile - Real2Twin Indoor OTA
 ======================================
-Topology:
-  gnb-real  (d430)         -- OAI gNB (Docker) + OAI CN (Docker)
-                              accesses X310 radio over Ethernet via UHD
-  twin      (d430)         -- Tiny_Twin gNB + CN (Docker, RFsim + CIR FIFO)
-  gnb-x310-2 (ota-x310-2) }
-  gnb-x310-3 (ota-x310-3) } X310 SDR pool - orchestrator probes each at run
-  gnb-x310-4 (ota-x310-4) } time and selects whichever responds to UHD.
-  ue-nuc1~4 (ota-nuc1~4)  -- Intel NUC nodes with Quectel RM500Q COTS 5G UEs
 
-Spectrum: 3430-3450 MHz (n78, matches approved NICELabExp reservation)
+Topology (matches POWDER's official oai-indoor-ota reference pattern):
 
-ctrl-lan IPs (192.168.1.0/24):
-  gnb-real    192.168.1.1
-  twin        192.168.1.2
-  gnb-x310-2  192.168.1.12
-  gnb-x310-3  192.168.1.13
-  gnb-x310-4  192.168.1.14
-  ue-nuc1     192.168.1.21 ... ue-nuc4 192.168.1.24
+    gnb-real (d430) <-- 10G fiber radio-link --> gnb-x310 (ota-x310-N)
+        |                                           |
+        |                                          (ctrl-lan reachability
+        |                                           NOT used for X310 - the
+        |                                           USRP only speaks UHD on
+        |                                           the dedicated radio link)
+        |
+        +--- ctrl-lan (192.168.1.0/24) ---+
+                                          |
+        twin (d430) ----------------------+
+                                          |
+        ue-nuc1..4 (ota-nucN, COTS UE) ---+
 
-Upload at powderwireless.net -> My Profiles -> Create Profile.
-Copy the UUID into register_and_instantiate_ota.py.
+Why a dedicated radio-link instead of joining X310 to ctrl-lan:
+  POWDER's switch fabric only provisions an X310's 10G fiber when the
+  profile declares `request.Link()` between the X310 and a paired compute
+  node. Putting the X310 on a shared LAN does not bring up the fiber and
+  the ctrl-lan IP for the X310 is unreachable. See
+  https://github.com/sayaz/OAI-Indoor-OTA-5G-NR profile_x310_b210.py
+  and the official PowderTeam/oai-indoor-ota profile.
+
+Spectrum: 3430-3450 MHz (n78, NICELabExp reservation).
+
+IP scheme:
+  ctrl-lan    192.168.1.0/24    - gnb-real / twin / ue-nucs
+  radio-link  192.168.40.0/24   - gnb-real (192.168.40.1) <-> X310 (192.168.40.2)
+                                   X310 default UHD addr is 192.168.40.2
+
+Upload at powderwireless.net -> My Profiles -> Create Profile, or pull
+from https://github.com/ZzZTripleZzZ/POWDER_Twin (powder/profile_real_twin_ota.py).
 """
 
 import base64
@@ -34,33 +46,31 @@ import geni.rspec.emulab.spectrum as spectrum
 TINY_TWIN_REPO = "https://github.com/ZzZTripleZzZ/POWDER_Twin.git"
 EMULAB_CM      = "urn:publicid:IDN+emulab.net+authority+cm"
 
-# ota-x310-1 was confirmed dead (no UHD/ARP/ICMP response after portal reboot
-# on 2026-05-08). Allocating -2/-3/-4 instead so the orchestrator can probe
-# each at runtime and pick whichever USRP actually responds.
-FIXED_NODES = {
-    "gnb-x310-2": "urn:publicid:IDN+emulab.net+node+ota-x310-2",
-    "gnb-x310-3": "urn:publicid:IDN+emulab.net+node+ota-x310-3",
-    "gnb-x310-4": "urn:publicid:IDN+emulab.net+node+ota-x310-4",
-    "ue-nuc1":    "urn:publicid:IDN+emulab.net+node+ota-nuc1",
-    "ue-nuc2":    "urn:publicid:IDN+emulab.net+node+ota-nuc2",
-    "ue-nuc3":    "urn:publicid:IDN+emulab.net+node+ota-nuc3",
-    "ue-nuc4":    "urn:publicid:IDN+emulab.net+node+ota-nuc4",
+# UE NUC nodes only. The X310 is allocated separately and connected to
+# gnb-real via a dedicated 10G fiber Link (see X310_RADIO + radio-link below)
+# rather than joining ctrl-lan.
+NUC_FIXED_NODES = {
+    "ue-nuc1": "urn:publicid:IDN+emulab.net+node+ota-nuc1",
+    "ue-nuc2": "urn:publicid:IDN+emulab.net+node+ota-nuc2",
+    "ue-nuc3": "urn:publicid:IDN+emulab.net+node+ota-nuc3",
+    "ue-nuc4": "urn:publicid:IDN+emulab.net+node+ota-nuc4",
 }
 
+# ctrl-lan: gnb-real + twin + ue-nucs (NOT the X310).
 CTRL_LAN_IPS = {
-    "gnb-real":   "192.168.1.1",
-    "twin":       "192.168.1.2",
-    "gnb-x310-2": "192.168.1.12",
-    "gnb-x310-3": "192.168.1.13",
-    "gnb-x310-4": "192.168.1.14",
-    "ue-nuc1":    "192.168.1.21",
-    "ue-nuc2":    "192.168.1.22",
-    "ue-nuc3":    "192.168.1.23",
-    "ue-nuc4":    "192.168.1.24",
+    "gnb-real": "192.168.1.1",
+    "twin":     "192.168.1.2",
+    "ue-nuc1":  "192.168.1.21",
+    "ue-nuc2":  "192.168.1.22",
+    "ue-nuc3":  "192.168.1.23",
+    "ue-nuc4":  "192.168.1.24",
 }
 
-# Candidates the orchestrator probes via uhd_find_devices; first responder wins.
-X310_CANDIDATE_IPS = ["192.168.1.12", "192.168.1.13", "192.168.1.14"]
+# X310 reachable from gnb-real on the dedicated radio-link.
+# UHD discovery uses the X310's default 10G transport address.
+X310_RADIO_LINK_IP_GNB = "192.168.40.1"
+X310_RADIO_LINK_IP_X310 = "192.168.40.2"
+X310_CANDIDATE_IPS = [X310_RADIO_LINK_IP_X310]
 
 # -- Portal parameters ------------------------------------------------------
 
@@ -81,6 +91,17 @@ pc.defineParameter(
 pc.defineParameter(
     "max_power_dbm", "Max TX power (dBm)",
     portal.ParameterType.STRING, "30.0",
+)
+pc.defineParameter(
+    "x310_id",
+    "X310 SDR component (ota-x310-1 dead 2026-05-08; pick -2/-3/-4)",
+    portal.ParameterType.STRING, "ota-x310-2",
+    [
+        ("ota-x310-2", "ota-x310-2"),
+        ("ota-x310-3", "ota-x310-3"),
+        ("ota-x310-4", "ota-x310-4"),
+        ("ota-x310-1", "ota-x310-1 (likely broken)"),
+    ],
 )
 
 params = pc.bindParameters()
@@ -229,29 +250,44 @@ twin.hardware_type = "d430"
 twin.disk_image = "urn:publicid:IDN+emulab.net+image+emulab-ops:UBUNTU22-64-STD"
 twin.addService(pg.Execute(shell="bash", command=TWIN_STARTUP))
 
-# -- Fixed indoor OTA nodes -------------------------------------------------
+# -- X310 paired with gnb-real via dedicated 10G fiber radio-link -----------
+#
+# This is the POWDER OAI Indoor OTA pattern. The X310 is NOT joined to
+# ctrl-lan; instead a `request.Link()` declares the gnb-real <-> X310 fiber
+# so POWDER's switch fabric provisions the multi-Gbps path. Without this
+# link declaration the X310 is unreachable regardless of any IP scheme.
 
-fixed_nodes = {}
-for name, component_id in FIXED_NODES.items():
+gnb_x310 = request.RawPC("gnb-x310")
+gnb_x310.component_id = "urn:publicid:IDN+emulab.net+node+" + params.x310_id
+gnb_x310.component_manager_id = EMULAB_CM
+gnb_x310.requestSpectrum(freq_low, freq_high, max_power)
+
+usrp_if = gnb_real.addInterface("usrp-if")
+usrp_if.addAddress(pg.IPv4Address(X310_RADIO_LINK_IP_GNB, "255.255.255.0"))
+
+radio_link = request.Link("radio-link")
+radio_link.bandwidth = 10 * 1000 * 1000  # 10 Gbps fiber to OTA lab
+radio_link.addInterface(usrp_if)
+radio_link.addNode(gnb_x310)
+
+# -- COTS UE NUCs (ota-nuc1..4) ---------------------------------------------
+
+ue_nodes = {}
+for name, component_id in NUC_FIXED_NODES.items():
     n = request.RawPC(name)
     n.component_id = component_id
     n.component_manager_id = EMULAB_CM
-    if name.startswith("ue-nuc"):
-        n.addService(pg.Execute(shell="bash", command=NUC_STARTUP))
-    fixed_nodes[name] = n
+    n.addService(pg.Execute(shell="bash", command=NUC_STARTUP))
+    n.requestSpectrum(freq_low, freq_high, max_power)
+    ue_nodes[name] = n
 
-# -- Spectrum allocation on all radio nodes ---------------------------------
-
-for name in FIXED_NODES:
-    fixed_nodes[name].requestSpectrum(freq_low, freq_high, max_power)
-
-# -- Control LAN ------------------------------------------------------------
+# -- Control LAN: gnb-real + twin + ue-nucs (no X310) -----------------------
 
 ctrl_lan = request.LAN("ctrl-lan")
-all_nodes = {"gnb-real": gnb_real, "twin": twin}
-all_nodes.update(fixed_nodes)
+ctrl_lan_nodes = {"gnb-real": gnb_real, "twin": twin}
+ctrl_lan_nodes.update(ue_nodes)
 
-for name, node in all_nodes.items():
+for name, node in ctrl_lan_nodes.items():
     ip = CTRL_LAN_IPS[name]
     iface = node.addInterface("ctrl-if-" + name.replace("-", ""))
     iface.addAddress(pg.IPv4Address(ip, "255.255.255.0"))
