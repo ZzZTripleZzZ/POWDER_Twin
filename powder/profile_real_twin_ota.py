@@ -185,7 +185,7 @@ _GNB_REAL_INNER = (
     "echo \"gnb-real node ready (build running in background; tail /tmp/tt-gnb-build.log)\"\n"
 )
 
-# Twin builds gnb + nrue *serially* — d430 (64 GB RAM) was OOM-killing the
+# Twin builds gnb + nrue *serially* - d430 (64 GB RAM) was OOM-killing the
 # linker when both ran in parallel. Total wall time is ~80 min serial vs.
 # crash-and-restart parallel.
 _TWIN_INNER = (
