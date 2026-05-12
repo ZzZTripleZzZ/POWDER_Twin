@@ -262,8 +262,14 @@ RUN if [ -f executables/edgeric/edgeric.cpp ]; then \
 
 # find_package(UHD) is satisfied by ENV CMAKE_PREFIX_PATH=/usr (set above)
 # pointing CMake at /usr/lib/x86_64-linux-gnu/cmake/uhd/UHDConfig.cmake from
-# libuhd-dev. --cmake-opt was unreliable because OAI's build_oai performs
-# multiple cmake invocations and only the last received the override.
+# libuhd-dev. The UHD header path is injected via target_compile_options on
+# oai_usrpdevif (line ~222) — do NOT also pass -I via --cmake-opt because
+# build_oai strips the quotes around the multi-word value and CMake then sees
+# `-I/opt/uhd-include` as a top-level CLI arg and aborts with
+# "Unknown argument -I/opt/uhd-include". Use ENV instead if a global include
+# path is ever needed.
+ENV CFLAGS="-I/opt/uhd-include"
+ENV CXXFLAGS="-I/opt/uhd-include"
 RUN /bin/sh oaienv && \
     cd cmake_targets && \
     mkdir -p log && \
@@ -272,7 +278,7 @@ RUN /bin/sh oaienv && \
         --gNB --nrUE \
         --build-lib "telnetsrv enbscope uescope nrscope" \
         --cmake-opt -DXAPP_MULTILANGUAGE=OFF --cmake-opt -DKPM_VERSION=$KPM_VERSION --cmake-opt -DE2AP_VERSION=$E2AP_VERSION \
-        --cmake-opt -DCMAKE_C_FLAGS="-w -I/opt/uhd-include" --cmake-opt -DCMAKE_CXX_FLAGS="-w -I/opt/uhd-include" $BUILD_OPTION && \
+        --cmake-opt -DCMAKE_C_FLAGS=-w --cmake-opt -DCMAKE_CXX_FLAGS=-w $BUILD_OPTION && \
     ln -sf /usr/local/lib/liboai_usrpdevif.so /usr/local/lib/liboai_device.so && \
     ldconfig && \
     echo "---- ldd on executables ----" && \
