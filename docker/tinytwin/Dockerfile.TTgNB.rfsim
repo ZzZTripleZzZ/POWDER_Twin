@@ -1,0 +1,90 @@
+# Dockerfile.TTgNB.rfsim — slim tt-gnb image for RFsim-only experiments.
+#
+# Why this exists: the full TTgNB.ubuntu22 Dockerfile builds OAI with USRP
+# support and on noble+UHD 4.6.0 has hit a pile of include-path / cmake
+# quoting issues that block paper progress. dt_sync rfsim experiments do
+# NOT need any of that — nr-softmodem in rfsim mode talks TCP to nrUE, no
+# UHD anywhere on the wire.
+#
+# This image: same base (ubuntu:24.04) + cmake + ninja + OAI tree, but
+# build_oai runs with `-w None --rfsim` (no hardware backend). It compiles
+# in ~10-15 min vs ~50 min for the USRP variant, and bypasses every UHD
+# issue.
+#
+# Usage:
+#   cd ~/Tiny_Twin
+#   sudo docker build --target tt-gnb-rfsim \
+#       --file docker/tinytwin/Dockerfile.TTgNB.rfsim \
+#       -t tt-gnb-rfsim:v2 .
+
+FROM ubuntu:24.04 AS tt-gnb-rfsim
+
+ARG NEEDED_GIT_PROXY
+ARG TARGETARCH
+ARG BUILD_OPTION
+ARG E2AP_VERSION=E2AP_V3
+ARG KPM_VERSION=KPM_V3_00
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Europe/Paris
+
+# POWDER mirror for reliability inside Docker builds
+RUN sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.edge.kernel.org/ubuntu/|g' \
+        -e 's|http://security.ubuntu.com/ubuntu/|http://mirrors.edge.kernel.org/ubuntu/|g' \
+        /etc/apt/sources.list.d/ubuntu.sources
+
+RUN apt-get update && \
+    apt-get upgrade --yes && \
+    apt-get install --yes \
+        cmake ninja-build build-essential psmisc git \
+        gcc-12 g++-12 xxd \
+        libyaml-cpp-dev libpcre2-dev libforms-dev \
+        libgtest-dev libzmq3-dev \
+        protobuf-compiler libprotobuf-dev \
+        python3-dev python3-pip \
+        bison flex m4 && \
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+        --slave /usr/bin/g++ g++ /usr/bin/g++-12
+
+ENV TINI_VERSION=v0.19.0
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-${TARGETARCH} /tini
+RUN chmod +x /tini
+
+WORKDIR /tt-ran
+COPY . .
+
+# Patch python-tk -> python3-tk (noble has no python-tk metapackage).
+RUN sed -i 's/python-tk/python3-tk/g' cmake_targets/tools/build_helper
+
+# Patch EdgeRIC's hardcoded ZMQ publisher bind address: 192.168.70.140 is
+# only assigned to the gNB container on tt-public-net (or as a host alias
+# in network_mode: host). Bind 0.0.0.0 so the twin can subscribe from any
+# reachable interface.
+RUN if [ -f executables/edgeric/edgeric.cpp ]; then \
+      sed -i 's|tcp://192.168.70.140:5555|tcp://0.0.0.0:5555|g' \
+              executables/edgeric/edgeric.cpp; \
+    fi
+
+# build_oai with no hardware backend. --rfsim still builds the rfsimulator
+# .so so nr-softmodem accepts `--rfsim` at runtime, but the UHD/USRP paths
+# are not compiled in. KPM_V3_00 / E2AP_V3 still needed for E2 instrumentation
+# used by dt_sync state_sync.
+RUN /bin/sh oaienv && \
+    cd cmake_targets && \
+    mkdir -p log && \
+    ./build_oai -c -C && \
+    ./build_oai -c \
+        --gNB --nrUE \
+        --build-lib "telnetsrv enbscope uescope nrscope rfsimulator" \
+        --cmake-opt -DXAPP_MULTILANGUAGE=OFF \
+        --cmake-opt -DKPM_VERSION=$KPM_VERSION \
+        --cmake-opt -DE2AP_VERSION=$E2AP_VERSION && \
+    ldconfig && \
+    echo "---- ldd on executables ----" && \
+    ldd ran_build/build/nr-softmodem || true && \
+    ldd ran_build/build/nr-uesoftmodem || true
+
+WORKDIR /tt-ran
+ENTRYPOINT ["/tini", "-v", "--"]
+CMD ["/bin/bash"]

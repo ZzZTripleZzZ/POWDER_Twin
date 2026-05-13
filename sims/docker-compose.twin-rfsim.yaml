@@ -1,0 +1,143 @@
+# dt_sync TWIN-side rfsim stack (deployed on twin d430).
+#
+# Runs:
+#   twin-gnb    nr-softmodem with M3 fidelity hooks (TCP rfsim server :4043)
+#   twin-ue1-3  nr-uesoftmodem mirrors of the real UEs (same IMSI scheme)
+#
+# state_sync.py runs on the host (not in a container) and connects to:
+#   - twin-gnb EdgeRIC ZMQ (localhost) for twin metrics + weight injection
+#   - real-gnb EdgeRIC ZMQ via ctrl-lan (powder-cn-out, port 5555) for real metrics
+#
+# Prereq: tt-gnb-rfsim:v2 built on this node; tt-public-net docker network exists.
+
+services:
+  twin-gnb:
+    image: tt-gnb-rfsim:v2
+    container_name: twin-gnb
+    privileged: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - TT_CHANNEL_FILE_REAL=${TT_CHANNEL_FILE_REAL:-/tt-ran/channel/channel_clean.txt}
+      - TT_CHANNEL_FILE_IMAG=${TT_CHANNEL_FILE_IMAG:-/tt-ran/channel/channel_clean.txt}
+    volumes:
+      - ../logs:/tt-ran/logs
+      - /tmp:/tmp:rw
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        mkdir -p /tt-ran/logs &&
+        cd /tt-ran/cmake_targets/ran_build/build/ &&
+        exec ./nr-softmodem
+        -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+        --rfsim -E --sa
+        --rfsimulator.options chanmod
+        --TAP 1 --TTI 1 --SNR 1 --CQI 1 --TPT 1
+    networks:
+      public_net:
+        ipv4_address: 192.168.70.140
+    ports:
+      - "5557:5555"   # twin EdgeRIC PUB on host port 5557 (real-gnb uses 5555 on cn d430)
+      - "5558:5556"   # twin EdgeRIC SUB on host port 5558
+      - "4043:4043"   # twin rfsim TCP server
+    stdin_open: true
+    tty: true
+
+  twin-ue1:
+    image: tt-gnb-rfsim:v2
+    container_name: twin-ue1
+    privileged: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        cd /tt-ran/cmake_targets/ran_build/build/ &&
+        exec ./nr-uesoftmodem
+        --uicc0.imsi 001010000000001
+        -C 3619200000 -r 106 --numerology 1 --ssb 516
+        -E --sa --rfsim
+        --rfsimulator.options chanmod
+        --TAP 1
+        -O ../../../ci-scripts/conf_files/nrue.uicc.conf
+        --rfsimulator.serveraddr 192.168.70.140
+    networks:
+      public_net:
+        ipv4_address: 192.168.70.150
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - twin-gnb
+
+  twin-ue2:
+    image: tt-gnb-rfsim:v2
+    container_name: twin-ue2
+    privileged: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        cd /tt-ran/cmake_targets/ran_build/build/ &&
+        exec ./nr-uesoftmodem
+        --uicc0.imsi 001010000000002
+        -C 3619200000 -r 106 --numerology 1 --ssb 516
+        -E --sa --rfsim
+        --rfsimulator.options chanmod
+        --TAP 1
+        -O ../../../ci-scripts/conf_files/nrue.uicc.conf
+        --rfsimulator.serveraddr 192.168.70.140
+    networks:
+      public_net:
+        ipv4_address: 192.168.70.151
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - twin-gnb
+
+  twin-ue3:
+    image: tt-gnb-rfsim:v2
+    container_name: twin-ue3
+    privileged: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    entrypoint:
+      - /bin/bash
+      - -c
+      - >-
+        cd /tt-ran/cmake_targets/ran_build/build/ &&
+        exec ./nr-uesoftmodem
+        --uicc0.imsi 001010000000003
+        -C 3619200000 -r 106 --numerology 1 --ssb 516
+        -E --sa --rfsim
+        --rfsimulator.options chanmod
+        --TAP 1
+        -O ../../../ci-scripts/conf_files/nrue.uicc.conf
+        --rfsimulator.serveraddr 192.168.70.140
+    networks:
+      public_net:
+        ipv4_address: 192.168.70.152
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      - twin-gnb
+
+networks:
+  public_net:
+    external: true
+    name: tt-public-net
