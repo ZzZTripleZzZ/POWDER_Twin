@@ -332,6 +332,24 @@ void init_openair0()
     openair0_cfg[card].tx_num_channels = min(4, frame_parms->nb_antennas_tx);
     openair0_cfg[card].rx_num_channels = min(4, frame_parms->nb_antennas_rx);
 
+    /* DTSYNC_FIX_SAMPLE_RATE: upstream OAI moved sample-rate setup to
+       nr-ru.c::fill_rf_config(); our older nr-uesoftmodem.c never
+       populated openair0_cfg[card].sample_rate, leaving it 0 and the
+       USRP driver erroring with 'unknown sampling rate 0.000000'.
+       Replicate the upstream call here. */
+    {
+      int _dt_mu = frame_parms->numerology_index;
+      int _dt_N_RB = frame_parms->N_RB_DL;
+      int _dt_three = frame_parms->threequarter_fs;
+      get_samplerate_and_bw(_dt_mu, _dt_N_RB, _dt_three,
+                            &openair0_cfg[card].sample_rate,
+                            &openair0_cfg[card].samples_per_frame,
+                            &openair0_cfg[card].tx_bw,
+                            &openair0_cfg[card].rx_bw);
+      LOG_I(PHY, "DTSYNC_FIX: sample_rate=%f mu=%d N_RB=%d 3/4=%d\n",
+            openair0_cfg[card].sample_rate, _dt_mu, _dt_N_RB, _dt_three);
+    }
+
     LOG_I(PHY, "HW: Configuring card %d, sample_rate %f, tx/rx num_channels %d/%d, duplex_mode %s\n",
       card,
       openair0_cfg[card].sample_rate,
