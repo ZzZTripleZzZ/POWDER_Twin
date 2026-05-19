@@ -263,7 +263,7 @@ install_usrp_uhd_driver_from_source(){
             cp $OPENAIR_DIR/cmake_targets/tools/uhd-4.x-tdd-patch.diff $OPENAIR_DIR/cmake_targets/tools/uhd-4.5plus-tdd-patch.diff
             sed -i '9,13 s/STATE_OFF/STATE_RX1_OFF/' $OPENAIR_DIR/cmake_targets/tools/uhd-4.5plus-tdd-patch.diff
             sed -i '24,28 s/STATE_OFF/STATE_RX2_OFF/' $OPENAIR_DIR/cmake_targets/tools/uhd-4.5plus-tdd-patch.diff
-            git apply $OPENAIR_DIR/cmake_targets/tools/uhd-4.5plus-tdd-patch.diff
+            git apply $OPENAIR_DIR/cmake_targets/tools/uhd-4.5plus-tdd-patch.diff || echo "(TDD bit-7 patch skipped on UHD 4.8 — STATE_RX1_OFF already in source)"
             ret=$?;[[ $ret -ne 0 ]] && echo_fatal "Could not apply the TDD patch"
         else
             # Tested that patch for the following versions:

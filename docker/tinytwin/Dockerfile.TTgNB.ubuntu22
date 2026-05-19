@@ -14,8 +14,11 @@ ARG KPM_VERSION=KPM_V3_00
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Europe/Paris
-# ENV BUILD_UHD_FROM_SOURCE=True
-# ENV UHD_VERSION=4.4.0.0
+ENV BUILD_UHD_FROM_SOURCE=True
+ENV UHD_VERSION=4.7.0.0
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV CXXFLAGS="-Wno-error=deprecated-declarations -Wno-error=array-bounds"
+ENV CFLAGS="-Wno-error=deprecated-declarations -Wno-error=array-bounds"
 
 # POWDER nodes occasionally fail DNS resolution for the default Ubuntu mirrors
 # from inside Docker builds. Use a mirror that is reachable from Emulab.
@@ -25,6 +28,15 @@ RUN sed -i \
         /etc/apt/sources.list.d/ubuntu.sources
 
 #install developers pkg/repo
+# DTSYNC_V13_NOBLE_PREEMPT: PEP 668 + python deps + UHD build flags
+RUN rm -f /usr/lib/python3.12/EXTERNALLY-MANAGED && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3-mako python3-requests python3-numpy python3-docutils \
+        python3-setuptools python3-ruamel.yaml \
+        libusb-1.0-0-dev libboost-all-dev linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes && \
     DEBIAN_FRONTEND=noninteractive apt-get install --yes \
@@ -80,6 +92,8 @@ RUN /bin/bash -c "if [[ -v NEEDED_GIT_PROXY ]]; then git config --global http.pr
 # RUN rm -Rf /oai-ran
 WORKDIR /tt-ran
 COPY . .
+
+
     
 RUN apt-get update && apt-get install -y \
     libyaml-cpp-dev
@@ -150,8 +164,7 @@ RUN apt-get update && \
         python3-requests \
         libusb-1.0-0 \
         libyaml-cpp-dev \
-        uhd-host \
-        libuhd-dev && \
+        && \
     # if the --sanitize option was used to build, additional packages are required
     /bin/bash -c 'if [[ "$BUILD_OPTION" = "--sanitize" ]]; then DEBIAN_FRONTEND=noninteractive apt-get install --yes \
         #libasan5 \ # see below
@@ -181,47 +194,12 @@ RUN apt-get update && \
 # correctly the compile saw no -I and the build broke at
 # `#include <uhd/version.hpp>`. Symlink the package's uhd/ tree under
 # /opt/uhd-include/uhd/ and point the shim at /opt/uhd-include.
-RUN mkdir -p /usr/lib/cmake/UHD /opt/uhd-include && \
-    cp -a /usr/lib/x86_64-linux-gnu/cmake/uhd/. /usr/lib/cmake/UHD/ && \
-    test -f /usr/lib/x86_64-linux-gnu/libuhd.so && \
-    ln -sfn /usr/include/uhd /opt/uhd-include/uhd && \
-    test -f /opt/uhd-include/uhd/version.hpp && \
-    printf '%s\n' \
-        '# dt_sync replacement UHDConfig.cmake - skips libuhd-dev (4.6.0)' \
-        '# find_library + get_filename_component logic which fails under' \
-        "# OAI's build_oai (env-stripping wrapper). Hardcodes noble paths." \
-        'list(INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_LIST_DIR}")' \
-        'set(ENV{UHD_CONFIG_USED} TRUE)' \
-        'set(UHD_INCLUDE_DIRS  "/opt/uhd-include" CACHE PATH "UHD include dir" FORCE)' \
-        'set(UHD_LIBRARIES     "/usr/lib/x86_64-linux-gnu/libuhd.so" CACHE FILEPATH "UHD library" FORCE)' \
-        'set(UHD_FOUND         TRUE  CACHE BOOL "" FORCE)' \
-        'set(UHD_RFNOC_FOUND   TRUE  CACHE BOOL "" FORCE)' \
-        'include(FindPackageHandleStandardArgs)' \
-        'FIND_PACKAGE_HANDLE_STANDARD_ARGS(UHD DEFAULT_MSG UHD_LIBRARIES UHD_INCLUDE_DIRS)' \
-        'mark_as_advanced(UHD_LIBRARIES UHD_INCLUDE_DIRS)' \
-        'message(STATUS "dt_sync UHD shim: UHD_INCLUDE_DIRS=${UHD_INCLUDE_DIRS} UHD_LIBRARIES=${UHD_LIBRARIES}")' \
-        > /usr/lib/cmake/UHD/UHDConfig.cmake && \
-    cat /usr/lib/cmake/UHD/UHDConfig.cmake
 
 # Patch OAI's USRP CMakeLists.txt: the original `find_package(UHD REQUIRED UHD)`
 # treats the trailing 'UHD' as a required component, which trips UHDConfig.cmake
 # internal validator with "get_filename_component called with incorrect number
 # of arguments" (line 90). Drop the redundant component so find_package uses
 # the standard single-argument REQUIRED form.
-RUN sed -i 's/find_package(UHD REQUIRED UHD)/find_package(UHD REQUIRED)/g' \
-        radio/USRP/CMakeLists.txt && \
-    grep "find_package(UHD" radio/USRP/CMakeLists.txt && \
-    \
-    # Hardcode the include path on the oai_usrpdevif target. CMake's \
-    # target_include_directories silently filters paths that match the \
-    # compiler's implicit system search list - even our /opt/uhd-include \
-    # staging didn't survive somehow. Append a literal hardcoded path \
-    # via target_compile_options(... -I...) which CMake passes through \
-    # untouched. \
-    grep -q '/opt/uhd-include' radio/USRP/CMakeLists.txt || \
-    sed -i '/^target_include_directories(oai_usrpdevif/a\target_compile_options(oai_usrpdevif PRIVATE -I/opt/uhd-include)' \
-        radio/USRP/CMakeLists.txt && \
-    grep -E 'target_(include_directories|compile_options).*oai_usrpdevif' radio/USRP/CMakeLists.txt
 
 # WORKDIR /opt/oai-gnb/bin
 # COPY --from=gnb-build \
@@ -268,17 +246,25 @@ RUN if [ -f executables/edgeric/edgeric.cpp ]; then \
 # `-I/opt/uhd-include` as a top-level CLI arg and aborts with
 # "Unknown argument -I/opt/uhd-include". Use ENV instead if a global include
 # path is ever needed.
-ENV CFLAGS="-I/opt/uhd-include"
-ENV CXXFLAGS="-I/opt/uhd-include"
 RUN /bin/sh oaienv && \
     cd cmake_targets && \
     mkdir -p log && \
     ./build_oai -C && \
-    ./build_oai -I -w USRP \
+    UHD_RC=0 && \
+    ( ./build_oai -I -w USRP \
         --gNB --nrUE \
         --build-lib "telnetsrv enbscope uescope nrscope" \
         --cmake-opt -DXAPP_MULTILANGUAGE=OFF --cmake-opt -DKPM_VERSION=$KPM_VERSION --cmake-opt -DE2AP_VERSION=$E2AP_VERSION \
-        --cmake-opt -DCMAKE_C_FLAGS=-w --cmake-opt -DCMAKE_CXX_FLAGS=-w $BUILD_OPTION && \
+        --cmake-opt -DCMAKE_C_FLAGS=-w --cmake-opt -DCMAKE_CXX_FLAGS=-w $BUILD_OPTION ) || UHD_RC=$? && \
+    if [ "$UHD_RC" -ne 0 ]; then \
+        echo "=== build_oai FAILED (exit=$UHD_RC); dumping logs ==="; \
+        ls -la /tt-ran/cmake_targets/log/ 2>&1 || true; \
+        echo "--- uhd_install_log.txt ---"; \
+        tail -200 /tt-ran/cmake_targets/log/uhd_install_log.txt 2>&1 || true; \
+        echo "--- all.txt ---"; \
+        tail -100 /tt-ran/cmake_targets/log/all.txt 2>&1 || true; \
+        exit $UHD_RC; \
+    fi && \
     ln -sf /usr/local/lib/liboai_usrpdevif.so /usr/local/lib/liboai_device.so && \
     ldconfig && \
     echo "---- ldd on executables ----" && \
