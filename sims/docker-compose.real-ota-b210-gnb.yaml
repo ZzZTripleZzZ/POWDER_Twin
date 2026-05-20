@@ -22,11 +22,12 @@ services:
       - /dev/bus/usb:/dev/bus/usb
     environment:
       - TZ=America/Denver
+    entrypoint: ["/tini", "--"]
     command:
       - /tt-ran/cmake_targets/ran_build/build/nr-softmodem
       - -O
       - /tt-ran/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.51PRB.usrpb210.dt-ota.conf
       - --sa
       - --usrp-args
-      - type=b200,master_clock_rate=23.04e6
+      - type=b200
     restart: "no"
