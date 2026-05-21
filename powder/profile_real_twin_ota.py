@@ -31,7 +31,8 @@ Spectrum: 3430-3450 MHz (n78, NICELabExp reservation).
 IP scheme:
   ctrl-lan    192.168.1.0/24    - gnb-real / twin / ue-nucs
   radio-link  192.168.40.0/24   - gnb-real (192.168.40.1) <-> X310 (192.168.40.2)
-                                   X310 default UHD addr is 192.168.40.2
+                                   real_twin_eval also probes the manifest IP
+                                   and common X310 factory transport IPs.
 
 Upload at powderwireless.net -> My Profiles -> Create Profile, or pull
 from https://github.com/ZzZTripleZzZ/POWDER_Twin (powder/profile_real_twin_ota.py).
@@ -66,8 +67,9 @@ CTRL_LAN_IPS = {
     "ue-nuc4":  "192.168.1.24",
 }
 
-# X310 reachable from gnb-real on the dedicated radio-link.
-# UHD discovery uses the X310's default 10G transport address.
+# X310 reachable from gnb-real on the dedicated radio-link.  Assign both
+# endpoint addresses explicitly so the manifest, profile docs, and orchestrator
+# agree; otherwise POWDER may auto-assign the X310 side (for example 10.10.1.2).
 X310_RADIO_LINK_IP_GNB = "192.168.40.1"
 X310_RADIO_LINK_IP_X310 = "192.168.40.2"
 X310_CANDIDATE_IPS = [X310_RADIO_LINK_IP_X310]
@@ -265,10 +267,13 @@ gnb_x310.requestSpectrum(freq_low, freq_high, max_power)
 usrp_if = gnb_real.addInterface("usrp-if")
 usrp_if.addAddress(pg.IPv4Address(X310_RADIO_LINK_IP_GNB, "255.255.255.0"))
 
+x310_if = gnb_x310.addInterface("if0")
+x310_if.addAddress(pg.IPv4Address(X310_RADIO_LINK_IP_X310, "255.255.255.0"))
+
 radio_link = request.Link("radio-link")
 radio_link.bandwidth = 10 * 1000 * 1000  # 10 Gbps fiber to OTA lab
 radio_link.addInterface(usrp_if)
-radio_link.addNode(gnb_x310)
+radio_link.addInterface(x310_if)
 
 # -- COTS UE NUCs (ota-nuc1..4) ---------------------------------------------
 

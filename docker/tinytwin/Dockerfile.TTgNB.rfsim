@@ -66,24 +66,28 @@ RUN if [ -f executables/edgeric/edgeric.cpp ]; then \
               executables/edgeric/edgeric.cpp; \
     fi
 
-# build_oai with no hardware backend. --rfsim still builds the rfsimulator
-# .so so nr-softmodem accepts `--rfsim` at runtime, but the UHD/USRP paths
-# are not compiled in. KPM_V3_00 / E2AP_V3 still needed for E2 instrumentation
-# used by dt_sync state_sync.
+# build_oai with -w SIMU (no real hardware backend). librfsimulator.so is
+# always built; the runtime --rfsim flag selects it. KPM_V3_00 / E2AP_V3
+# still needed for E2 instrumentation used by dt_sync state_sync.
+#
+# Flag meanings (per cmake_targets/build_oai --help): -C = full clean,
+# -I = install + build, --gNB / --nrUE = enable those targets, -w = hardware.
+# DO NOT use lowercase -c on the build line — it means CLEAN, no build.
 RUN /bin/sh oaienv && \
     cd cmake_targets && \
     mkdir -p log && \
-    ./build_oai -c -C && \
-    ./build_oai -c \
+    ./build_oai -C && \
+    ./build_oai -I -w SIMU \
         --gNB --nrUE \
-        --build-lib "telnetsrv enbscope uescope nrscope rfsimulator" \
+        --build-lib "telnetsrv enbscope uescope nrscope" \
         --cmake-opt -DXAPP_MULTILANGUAGE=OFF \
         --cmake-opt -DKPM_VERSION=$KPM_VERSION \
-        --cmake-opt -DE2AP_VERSION=$E2AP_VERSION && \
+        --cmake-opt -DE2AP_VERSION=$E2AP_VERSION \
+        --cmake-opt -DCMAKE_C_FLAGS=-w --cmake-opt -DCMAKE_CXX_FLAGS=-w && \
     ldconfig && \
     echo "---- ldd on executables ----" && \
-    ldd ran_build/build/nr-softmodem || true && \
-    ldd ran_build/build/nr-uesoftmodem || true
+    ldd ran_build/build/nr-softmodem && \
+    ldd ran_build/build/nr-uesoftmodem
 
 WORKDIR /tt-ran
 ENTRYPOINT ["/tini", "-v", "--"]

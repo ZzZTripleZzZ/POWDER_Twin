@@ -8,12 +8,12 @@
 
 ## One-Sentence Contribution
 
-> **"A live, drift-aware RAN digital twin with provable MAC-state equivalence and a selective-fidelity counterfactual scheduling oracle that safely evaluates candidate scheduler policies at TTI granularity without disrupting production traffic."**
+> **"A live, drift-aware RAN digital twin with bounded metrics-layer MAC-state equivalence and a selective-fidelity counterfactual scheduling oracle that safely evaluates fixed-weight scheduler candidates over TTI-scale rollouts without disrupting production traffic."**
 
 | Mechanism | Role | Files | Status |
 |---|---|---|---|
 | **M1** Drift-aware live calibration | KL drift metric `D(t)`; trigger-based EMA recalibration | `channel_converter.py` + `state_sync.py` | ✅ Done |
-| **M2** Counterfactual scheduler oracle | Shadow-policy rollout on live twin; bootstrap CI improvement bound; deploy gate | `counterfactual_oracle.py` + `e3_rl_eval.py` | ✅ Done |
+| **M2** Counterfactual scheduler oracle | Fixed-weight candidate rollout on live twin; bootstrap CI improvement bound; deploy gate | `counterfactual_oracle.py` + `e3_rl_eval.py` | ✅ Done |
 | **M3** Selective-fidelity twin | Three-tier PHY fidelity (`full_iq` / `sparse_tap` / `mac_only`); decision-sensitivity-driven mode selection | `selective_fidelity.py` + Tiny_Twin C patch | ✅ Done |
 | **M4** Provable MAC-state equivalence | Formal bound Δ ≤ K + ⌈(R+S)/T_TTI⌉ on metrics-layer skew; REQ/REP reconciliation protocol | `mac_equivalence.py` + `proto/` | ✅ Done |
 
@@ -44,7 +44,7 @@ Samsung's 2025 Sim2Real report quantifies the result: **only 39% twin–real KPI
 Three developments make a solution tractable now:
 
 - **Tiny_Twin** (2025) proved that a full OAI NR stack (gNB + UE + CN) can run on commodity CPUs via RFsimulator, removing the FPGA requirement.
-- **EdgeRIC** (NSDI'24) exposed a real-time ZMQ interface for per-TTI scheduler weight injection, making shadow-policy evaluation via the same protocol feasible.
+- **EdgeRIC** (NSDI'24) exposed a real-time ZMQ interface for scheduler weight injection, making fixed-weight shadow evaluation via the same protocol feasible. Per-TTI causal action evaluation is future work and requires action acknowledgements in the EdgeRIC wire protocol.
 - **POWDER** provides a stable B210 OTA testbed with reproducible channel conditions, enabling ground-truth comparison between twin and real.
 
 Our system, dt_sync, is the first to combine all three into a **closed-loop live twin** that self-calibrates, maintains formal state equivalence, adapts its compute budget to the decision at hand, and provides statistically-guaranteed policy rankings before any deployment.
@@ -234,16 +234,16 @@ Laplace smoothing ε = 1e-6. Trigger EMA update iff D(t) > τ_drift (default 0.1
 
 ### Intuition
 
-At time t, the real gNB's scheduler is running policy π_real. We want to evaluate candidate π_i **before** deploying it. The live twin, synchronized to the real channel and MAC state (via M1+M4), provides a virtual testbed. We inject π_i into N parallel twin replicas and measure the reward distribution over H TTIs.
+At time t, the real gNB's scheduler is running policy π_real. We want to evaluate candidate π_i **before** deploying it. The live twin, synchronized to the real channel and observable MAC metrics state (via M1+M4), provides a virtual testbed. In the current implementation, each candidate is evaluated as a **per-rollout fixed-weight policy**: the oracle computes one weight vector from the first fresh in-rollout metrics observation, injects it once, freezes it over H TTIs, and measures the resulting reward distribution across N replicas.
 
-The key insight that no prior work has exploited: **EdgeRIC's existing ZMQ interface (weight injection on :5556) and metrics reporting (:5555) already support exactly this evaluation loop.** No custom rollout server is needed. The oracle reuses the production EdgeRIC control plane as a counterfactual evaluation engine.
+The key insight that no prior work has exploited: **EdgeRIC's existing ZMQ interface (weight injection on :5556) and metrics reporting (:5555) already support this fixed-weight evaluation loop.** No custom rollout server is needed. A fully causal per-TTI oracle will require `action_seq` / `target_tti_seq` acknowledgements from the EdgeRIC side and is left for the next iteration.
 
 ### Formalization
 
 Real-side reward baseline (from live `layer2_mac_sync`):
 $$r_t^\text{real} = \sum_{u \in \text{UE}} \bigl(\text{tpt}_u - \lambda \cdot \text{BLER}_u - \mu \cdot \text{queue\_age}_u\bigr), \quad \lambda=50, \mu=0.01$$
 
-For each candidate π_i, rollout on N replicas over H TTIs yields samples $\{r^{(j)}_i\}_{j=1}^N$.
+For each candidate π_i, a fixed-weight rollout on N replicas over H TTIs yields samples $\{r^{(j)}_i\}_{j=1}^N$.
 
 **Improvement** (positive = candidate is better than baseline):
 $$\widehat{\Delta}_i = \frac{1}{N}\sum_j r^{(j)}_i - \frac{1}{|\mathcal{B}|}\sum_{b \in \mathcal{B}} r^{(b)}_\text{real}$$
@@ -259,7 +259,7 @@ N=4 replicas give too few samples for CLT. Bootstrap is distribution-free and co
 
 ### Implementation
 
-- `counterfactual_oracle.py`: `CounterfactualOracle`, `Policy` ABC, `EqualWeightPolicy`, `MaxCQIPolicy`, `EdgeRICPPOPolicy`, `PerturbedPolicy`, `bootstrap_improvement_ci`, `compute_reward`, `PolicyVerdict`
+- `counterfactual_oracle.py`: `CounterfactualOracle`, `Policy` ABC, `EqualWeightPolicy`, `MaxCQIPolicy`, `EdgeRICPPOPolicy`, `PerturbedPolicy`, `bootstrap_improvement_ci`, `compute_reward`, `PolicyVerdict(rollout_semantics="fixed_weight")`
 - `e3_rl_eval.py` (E2 harness): 5-candidate ranking, Spearman ρ vs ground truth, top-1 accuracy, unsafe rejection rate, CSV + PDF output
 - Replica ports: metrics SUB on 5555+10i, weights PUB on 5556+10i (i=0..N-1)
 - Mock mode: `--mock` uses synthetic reward maps for all E2 logic; smoke test passes
@@ -329,9 +329,9 @@ Dynamic env-var switching inside OAI C code would require locks and is unsafe. P
 
 ### Scope of the Claim
 
-M4's formal guarantee applies to the **orchestrator's metrics-layer view**: the Metrics protobuf most recently forwarded by `layer2_mac_sync`, which contains per-UE (CQI, BLER, HARQ state, BSR, queue depth). This is exactly the state used as the starting point for M2 oracle rollouts.
+M4's formal guarantee applies to the **orchestrator's metrics-layer view**: the Metrics protobuf most recently forwarded by `layer2_mac_sync`. When EdgeRIC fills the extended fields, this view contains per-UE (CQI, BLER proxy, HARQ state, BSR, queue depth). With older/current EdgeRIC producers that leave HARQ/BSR/queue-age unset, the guarantee honestly scopes to the populated schema-visible metrics, not hidden OAI scheduler internals.
 
-We do **not** claim that OAI's internal C scheduler state is synchronized — that is inaccessible from Python. The metrics-layer view is sufficient for the oracle's correctness: the only bias the skew introduces is in the initial condition of each rollout, which is bounded by Δ and well within the H=200 TTI horizon.
+We do **not** claim that OAI's internal C scheduler state is synchronized — that is inaccessible from Python. The metrics-layer view is sufficient for the current fixed-weight oracle's input and reward accounting; the only bias the skew introduces is in the initial observable condition of each rollout, which is bounded by Δ and well within the H=200 TTI horizon.
 
 **This is the first formal analysis of metrics-layer state skew in any published RAN-DT system.**
 

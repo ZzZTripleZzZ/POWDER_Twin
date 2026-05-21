@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-find_b210.py -- List available B210 fixed endpoints on POWDER/Emulab.
+find_b210.py -- DEPRECATED. List available B210 fixed endpoints on POWDER/Emulab.
 
-Usage:
+DEPRECATED: this script only filters by node status/name and cannot tell whether
+a B210 endpoint is RX-only (e.g. humanities nuc1) or full TX/RX, nor whether it
+covers a given band. Use the richer audit instead:
+
+    python3 powder/auto_schedule.py --audit
+    python3 powder/auto_schedule.py --audit --audit-band 3550-3700
+
+The --audit subcommand reads POWDER's radioinfo JSON and dumps per-frontend
+transmit_frequencies / receive_frequencies, which is what you actually need to
+find a replacement for humanities (whose nuc1 has empty transmit_frequencies).
+
+Usage (legacy):
     python3 powder/find_b210.py --user zifan716 --password <your_password>
 
 Or set env vars:

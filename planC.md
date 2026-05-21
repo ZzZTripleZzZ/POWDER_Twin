@@ -8,12 +8,12 @@
 
 ## 一句话贡献
 
-> **"一个实时、漂移感知的 RAN 数字孪生系统，具备可证明的 MAC 状态等价性，以及一个选择性精度反事实调度决策引擎——在不中断生产流量的前提下，以 TTI 粒度安全评估候选调度策略。"**
+> **"一个实时、漂移感知的 RAN 数字孪生系统，具备有界的度量层 MAC 状态等价性，以及一个选择性精度反事实调度决策引擎——在不中断生产流量的前提下，在 TTI 级 rollout 上安全评估固定权重候选调度策略。"**
 
 | 机制 | 作用 | 代码文件 | 状态 |
 |---|---|---|---|
 | **M1** 漂移感知实时校准 | KL 漂移度量 `D(t)`；触发式 EMA 重校准 | `channel_converter.py` + `state_sync.py` | ✅ 完成 |
-| **M2** 反事实调度决策引擎 | 在实时孪生上运行影子策略；自举置信区间改进量下界；部署门控 | `counterfactual_oracle.py` + `e3_rl_eval.py` | ✅ 完成 |
+| **M2** 反事实调度决策引擎 | 在实时孪生上运行固定权重候选策略 rollout；自举置信区间改进量下界；部署门控 | `counterfactual_oracle.py` + `e3_rl_eval.py` | ✅ 完成 |
 | **M3** 选择性精度孪生 | 三档 PHY 精度（`full_iq` / `sparse_tap` / `mac_only`）；决策敏感性驱动的模式选择 | `selective_fidelity.py` + Tiny_Twin C 补丁 | ✅ 完成 |
 | **M4** 可证明的 MAC 状态等价性 | 度量层状态偏差的形式化上界 Δ ≤ K + ⌈(R+S)/T_TTI⌉；REQ/REP 对账协议 | `mac_equivalence.py` + `proto/` | ✅ 完成 |
 
@@ -44,7 +44,7 @@
 以下三项进展使解决方案在当下变得可行：
 
 - **Tiny_Twin**（2025）证明了完整的 OAI NR 协议栈（gNB + UE + CN）可以通过 RFsimulator 在商用 CPU 上运行，消除了 FPGA 的硬件要求。
-- **EdgeRIC**（NSDI'24）暴露了用于每 TTI 调度权重注入的实时 ZMQ 接口，使得通过相同协议进行影子策略评估成为可能。
+- **EdgeRIC**（NSDI'24）暴露了实时 ZMQ 调度权重注入接口，使得通过相同协议进行固定权重影子策略评估成为可能。完整 per-TTI 因果动作评估需要 EdgeRIC wire protocol 增加动作确认，留到下一轮实现。
 - **POWDER** 提供了稳定的 B210 OTA 测试平台，具有可复现的信道条件，支持孪生与真实网络之间的地面真值比较。
 
 我们的系统 dt_sync 首次将上述三者整合为一个**闭环实时孪生**，能够自校准、维持形式化状态等价性、根据当前决策动态调整计算预算，并在任何部署前提供统计保证的策略排名。
@@ -233,16 +233,16 @@ $$D(t) = \mathrm{KL}\!\left[\hat{p}_\text{real} \,\Big\|\, \hat{p}_\text{twin}\r
 
 ### 直觉
 
-在时刻 t，真实 gNB 的调度器正在运行策略 π_real。我们希望在部署候选策略 π_i 之前对其进行评估。经过 M1+M4 与真实信道和 MAC 状态同步的实时孪生，提供了一个虚拟测试平台。我们将 π_i 注入 N 个并行孪生副本，并测量 H TTI 上的奖励分布。
+在时刻 t，真实 gNB 的调度器正在运行策略 π_real。我们希望在部署候选策略 π_i 之前对其进行评估。经过 M1+M4 与真实信道和可观测 MAC metrics 状态同步的实时孪生，提供了一个虚拟测试平台。当前实现将每个候选策略作为**每个 rollout 固定一次权重的候选策略**来评估：决策引擎从 rollout 内第一条新鲜 metrics 计算一次权重向量，注入后在 H TTI 内冻结该权重，并在 N 个副本上测量奖励分布。
 
-关键洞见，且目前没有任何已有工作加以利用：**EdgeRIC 现有的 ZMQ 接口（:5556 权重注入和 :5555 指标上报）已经完整支持这一评估循环。** 无需定制的仿真服务器。决策引擎复用了生产环境的 EdgeRIC 控制平面作为反事实评估引擎。
+关键洞见，且目前没有任何已有工作加以利用：**EdgeRIC 现有的 ZMQ 接口（:5556 权重注入和 :5555 指标上报）已经支持这一固定权重评估循环。** 无需定制的仿真服务器。完整 per-TTI 因果 oracle 需要 EdgeRIC 侧提供 `action_seq` / `target_tti_seq` 确认，留到下一轮实现。
 
 ### 形式化定义
 
 真实侧奖励基线（来自实时 `layer2_mac_sync`）：
 $$r_t^\text{real} = \sum_{u \in \text{UE}} \bigl(\text{tpt}_u - \lambda \cdot \text{BLER}_u - \mu \cdot \text{queue\_age}_u\bigr), \quad \lambda=50, \mu=0.01$$
 
-对每个候选策略 π_i，在 N 个副本上仿真 H TTI，得到样本 $\{r^{(j)}_i\}_{j=1}^N$。
+对每个候选策略 π_i，在 N 个副本上执行固定权重 H TTI rollout，得到样本 $\{r^{(j)}_i\}_{j=1}^N$。
 
 **改进量**（正值表示候选优于基线）：
 $$\widehat{\Delta}_i = \frac{1}{N}\sum_j r^{(j)}_i - \frac{1}{|\mathcal{B}|}\sum_{b \in \mathcal{B}} r^{(b)}_\text{real}$$
@@ -258,7 +258,7 @@ N=4 个副本的样本量对中心极限定理而言太少。自举方法无需�
 
 ### 实现
 
-- `counterfactual_oracle.py`：`CounterfactualOracle`、`Policy` 抽象类、`EqualWeightPolicy`、`MaxCQIPolicy`、`EdgeRICPPOPolicy`、`PerturbedPolicy`、`bootstrap_improvement_ci`、`compute_reward`、`PolicyVerdict`
+- `counterfactual_oracle.py`：`CounterfactualOracle`、`Policy` 抽象类、`EqualWeightPolicy`、`MaxCQIPolicy`、`EdgeRICPPOPolicy`、`PerturbedPolicy`、`bootstrap_improvement_ci`、`compute_reward`、`PolicyVerdict(rollout_semantics="fixed_weight")`
 - `e3_rl_eval.py`（E2 评估框架）：5 候选策略排名、Spearman ρ 对比地面真值、Top-1 准确率、不安全策略拒绝率、CSV + PDF 输出
 - 副本端口：指标 SUB 在 5555+10i，权重 PUB 在 5556+10i（i=0..N-1）
 - Mock 模式：`--mock` 使用合成奖励表进行所有 E2 逻辑；冒烟测试通过
@@ -328,9 +328,9 @@ N=4 个副本的样本量对中心极限定理而言太少。自举方法无需�
 
 ### 声明范围
 
-M4 的形式化保证适用于**编排节点的度量层视图**：`layer2_mac_sync` 最近转发的 Metrics protobuf，包含逐 UE 的（CQI、BLER、HARQ 状态、BSR、队列深度）。这正是 M2 决策仿真起点所使用的状态。
+M4 的形式化保证适用于**编排节点的度量层视图**：`layer2_mac_sync` 最近转发的 Metrics protobuf。当 EdgeRIC 填充扩展字段时，这个视图包含逐 UE 的（CQI、BLER proxy、HARQ 状态、BSR、队列深度）。如果旧版或当前 EdgeRIC producer 没有填 HARQ/BSR/queue-age，则保证只覆盖已填充的 schema-visible metrics，而不覆盖隐藏的 OAI 内部调度器状态。
 
-我们**不**声明 OAI 内部 C 语言调度器状态是同步的——那在 Python 层无法访问。度量层视图对决策引擎的正确性已经足够：状态偏差引入的唯一偏差是每次仿真初始条件的误差，该误差由 Δ 有界，且远小于 H=200 TTI 的仿真水平线。
+我们**不**声明 OAI 内部 C 语言调度器状态是同步的——那在 Python 层无法访问。度量层视图足以支撑当前固定权重 oracle 的输入与奖励记账；状态偏差引入的唯一偏差是每次 rollout 初始可观测条件的误差，该误差由 Δ 有界，且远小于 H=200 TTI 的仿真水平线。
 
 **这是任何已发表 RAN 数字孪生系统中对度量层状态偏差的首次形式化分析。**
 

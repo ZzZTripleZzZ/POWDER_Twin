@@ -75,12 +75,17 @@ DUR_E3        = 120
 DUR_E5        = 120
 DUR_E6        = 120
 
-# X310 reachable from gnb-real on the dedicated radio-link (192.168.40.0/24).
-# The profile (powder/profile_real_twin_ota.py) declares a single Link
-# between gnb-real and one ota-x310-N selected by the x310_id parameter at
-# instantiation time, so only one candidate is reachable at runtime; the
-# X310 always responds at .2 (the USRP's 10G transport default address).
-X310_CANDIDATE_IPS = ["192.168.40.2"]
+# X310 reachable from gnb-real on the dedicated radio-link.  The intended
+# profile address is 192.168.40.2, but older instantiated profiles may have a
+# POWDER-assigned manifest IP such as 10.10.1.2.  Probe the manifest first,
+# then common X310 transport defaults.
+X310_CANDIDATE_IPS = [
+    "192.168.40.2",
+    "10.10.1.2",
+    "192.168.10.2",
+    "192.168.20.2",
+    "192.168.30.2",
+]
 
 
 _UHD_FAILURE_MARKERS = (
@@ -105,7 +110,10 @@ async def _select_live_x310(gnb: str) -> str:
     """
     import re as _re
 
-    for ip in X310_CANDIDATE_IPS:
+    candidates = await _x310_candidate_ips(gnb)
+    await _prepare_x310_routes(gnb, candidates)
+
+    for ip in candidates:
         out = await _ssh(gnb,
             f"timeout 12 uhd_find_devices --args 'addr={ip}' 2>&1 || true",
             check=False)
@@ -122,9 +130,64 @@ async def _select_live_x310(gnb: str) -> str:
             return ip
         print(f"[gNB] X310 {ip}: no device block in output", flush=True)
     raise RuntimeError(
-        f"No X310 in {X310_CANDIDATE_IPS} responded to UHD discovery on {gnb}. "
-        "All allocated USRPs are unreachable - escalate to POWDER support."
+        f"No X310 in {candidates} responded to UHD discovery on {gnb}. "
+        "The radio-link exists, but the USRP produced no UHD response; "
+        "capture tcpdump evidence and escalate to POWDER support."
     )
+
+
+async def _x310_candidate_ips(gnb: str) -> list[str]:
+    """Return X310 probe IPs, preferring the live manifest if available."""
+
+    manifest_cmd = r"""python3 - <<'PY'
+import subprocess
+import xml.etree.ElementTree as ET
+
+try:
+    xml = subprocess.check_output(["geni-get", "manifest"], text=True)
+    root = ET.fromstring(xml)
+except Exception:
+    raise SystemExit(0)
+
+for node in root.iter():
+    if not node.tag.endswith("node"):
+        continue
+    if node.attrib.get("client_id") != "gnb-x310":
+        continue
+    for iface in node.iter():
+        if not iface.tag.endswith("interface"):
+            continue
+        for ip in iface.iter():
+            if ip.tag.endswith("ip") and ip.attrib.get("address"):
+                print(ip.attrib["address"])
+PY"""
+    out = await _ssh(gnb, manifest_cmd, check=False)
+    ips: list[str] = []
+    for ip in out.split():
+        if ip.count(".") == 3 and ip not in ips:
+            ips.append(ip)
+    for ip in X310_CANDIDATE_IPS:
+        if ip not in ips:
+            ips.append(ip)
+    print(f"[gNB] X310 probe candidates: {ips}", flush=True)
+    return ips
+
+
+async def _prepare_x310_routes(gnb: str, candidates: list[str]) -> None:
+    """Add host-side .1/24 aliases for candidate .2 transport networks."""
+
+    aliases = []
+    for ip in candidates:
+        octets = ip.split(".")
+        if len(octets) != 4 or octets[-1] != "2":
+            continue
+        aliases.append(".".join(octets[:3] + ["1"]))
+    alias_cmd = " ".join(
+        f"sudo ip addr add {alias}/24 dev enp6s0f1 2>/dev/null || true;"
+        for alias in aliases
+    )
+    if alias_cmd:
+        await _ssh(gnb, alias_cmd, check=False)
 
 
 async def _wait_for_build(host: str, max_minutes: int = 90) -> None:

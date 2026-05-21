@@ -3,7 +3,9 @@
 # Or with conda: conda run -n dt_sync pip install -r requirements.txt
 
 # Core
-numpy>=1.24
+# Keep NumPy on the 1.x ABI until the local matplotlib stack is rebuilt for
+# NumPy 2.x; the E2/E3 mock plotting path otherwise emits binary-ABI tracebacks.
+numpy>=1.24,<2
 scipy>=1.11
 
 # Networking / ZMQ

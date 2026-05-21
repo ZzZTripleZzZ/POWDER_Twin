@@ -9,8 +9,8 @@ FROM ubuntu:24.04 AS tt-gnb
 ARG NEEDED_GIT_PROXY
 ARG TARGETARCH
 ARG BUILD_OPTION
-ARG E2AP_VERSION=E2AP_V3
-ARG KPM_VERSION=KPM_V3_00
+ARG E2AP_VERSION=E2AP_V2
+ARG KPM_VERSION=KPM_V2_03
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Europe/Paris
@@ -238,6 +238,26 @@ RUN if [ -f executables/edgeric/edgeric.cpp ]; then \
       echo "(no executables/edgeric/edgeric.cpp - skipping bind patch)"; \
     fi
 
+# Install FlexRIC for E2 agent support (tt-gnb:v3-e2).
+#
+# OAI's openair2/E2AP/CMakeLists.txt builds the E2 agent IN-TREE from
+# sources under openair2/E2AP/flexric/ (see add_subdirectory(flexric/src/...)
+# calls). That directory must exist BEFORE build_oai --build-e2 runs;
+# OAI's CMakeLists aborts with "FlexRIC submodule not present" otherwise.
+#
+# The historical fix `make install` to /usr/local does NOT help because
+# the OAI E2AP CMakeLists uses ${CMAKE_CURRENT_SOURCE_DIR}/flexric (a
+# path, not find_package). We therefore clone flexric directly into
+# openair2/E2AP/flexric/ at the OAI tag-tested commit. swig + libsctp-dev
+# are required at compile time for the agent.
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q swig libsctp-dev cmake-data && \
+    rm -rf openair2/E2AP/flexric && \
+    git clone https://gitlab.eurecom.fr/mosaic5g/flexric openair2/E2AP/flexric && \
+    (cd openair2/E2AP/flexric && git checkout f1c08ed2b9b1eceeda7941dd7bf435db0168dd56) && \
+    ls openair2/E2AP/flexric/CMakeLists.txt && \
+    rm -rf /var/lib/apt/lists/*
+
 # find_package(UHD) is satisfied by ENV CMAKE_PREFIX_PATH=/usr (set above)
 # pointing CMake at /usr/lib/x86_64-linux-gnu/cmake/uhd/UHDConfig.cmake from
 # libuhd-dev. The UHD header path is injected via target_compile_options on
@@ -246,13 +266,17 @@ RUN if [ -f executables/edgeric/edgeric.cpp ]; then \
 # `-I/opt/uhd-include` as a top-level CLI arg and aborts with
 # "Unknown argument -I/opt/uhd-include". Use ENV instead if a global include
 # path is ever needed.
-RUN /bin/sh oaienv && \
+# Cache-buster v3-e2-2026-05-20-15-25: previous buildkit layer was empty due
+# to a Docker 29.5 + containerd-snapshotter extraction bug. Force re-execution.
+RUN echo "build_oai-rerun-token=20260520-1525-v3e2" && \
+    /bin/sh oaienv && \
     cd cmake_targets && \
     mkdir -p log && \
     ./build_oai -C && \
     UHD_RC=0 && \
     ( ./build_oai -I -w USRP \
         --gNB --nrUE \
+        --build-e2 \
         --build-lib "telnetsrv enbscope uescope nrscope" \
         --cmake-opt -DXAPP_MULTILANGUAGE=OFF --cmake-opt -DKPM_VERSION=$KPM_VERSION --cmake-opt -DE2AP_VERSION=$E2AP_VERSION \
         --cmake-opt -DCMAKE_C_FLAGS=-w --cmake-opt -DCMAKE_CXX_FLAGS=-w $BUILD_OPTION ) || UHD_RC=$? && \

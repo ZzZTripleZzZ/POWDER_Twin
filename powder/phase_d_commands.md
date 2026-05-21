@@ -3,6 +3,13 @@
 **Prerequisites**: Phase A/B/C passed. POWDER OTA permission approved for 3550–3700 MHz.  
 **Goal**: Run all OTA-dependent experiments (E2, E4, E6) and validate the full M1–M4 system.
 
+**Current resource gate (2026-05-02)**: do not instantiate the B210 OTA
+profile unless `auto_schedule.py --audit` reports a non-empty
+`Auto-schedulable B210 pairs` section. POWDER campus B210 pairs currently show
+`nuc1` as RX-only and `nuc2` as TX/RX, so they cannot support a full NR attach
+where both gNB and UE transmit. Indoor OTA `emulab.net:ota-nuc*` pairs are the
+preferred B210 real-side target when available.
+
 Experiment mapping:
 - **E1** (cabled/OTA): drift dynamics — `state_sync.py --drift-log`
 - **E2** (OTA): oracle ranking accuracy — `e3_rl_eval.py --collect-ground-truth`
@@ -10,6 +17,29 @@ Experiment mapping:
 - **E4** (OTA): 4hr M2-gated safety run — `e4_safety_run.py`
 - **E5** (cabled): MAC equivalence — `mac_equivalence_twin_client.py --mock` (already runnable)
 - **E6** (OTA): Samsung gap KPI similarity — `e6_kpi_similarity.py`
+
+---
+
+## Step D-0A: Resource gate before any real-side instantiate
+
+```bash
+python3 powder/auto_schedule.py --audit --audit-band 3550-3700 \
+    > /tmp/powder_audit.tsv \
+    2> /tmp/powder_audit.summary
+
+cat /tmp/powder_audit.summary
+```
+
+Proceed with the B210 OTA profile only if the summary contains an actual pair
+under `Auto-schedulable B210 pairs`. A summary of `(none)` means the B210 branch
+is blocked by radio capability, not just reservations.
+
+Fallback for real-SDR real2twin smoke tests if Indoor OTA is reserved:
+
+```bash
+# Portal profile: powder/profile_real_x310_workbench.py
+# This is cabled X310, not OTA, but exercises real OAI/USRP behavior.
+```
 
 ---
 

@@ -193,6 +193,8 @@ async def layer1_channel_sync(
     calibrator=None,
     local_fifo: bool = False,
     drift_log_path: str = None,
+    sync_period_ms: float = 0.0,
+    sync_disable: bool = False,
 ) -> None:
     """
     Tail real SNR log → CQI → CIR (M1 trigger-based calibration) → named FIFO.
@@ -225,6 +227,10 @@ async def layer1_channel_sync(
     # Diagnostic counter: number of drift samples that fell back to analytic
     # twin_bler because no real twin ACK data was yet available.
     _twin_bler_fallback_count = [0]
+
+    # Sync-period throttle state (shared by local/remote FIFO writers).
+    _last_write_t = [0.0]
+    min_dt = (sync_period_ms or 0) / 1000.0
 
     # M3: mode selector state. The selector decides a *pending* mode whenever
     # signals shift; the *active* mode (what the C-side container is currently
@@ -456,19 +462,26 @@ async def layer1_channel_sync(
                     # current TT_FIDELITY_MODE). During a restart the C side
                     # has no reader on the FIFO, so suppress writes entirely
                     # to avoid blocking the writer.
-                    if not _m3_state["restarting"]:
-                        active_mode = _m3_state["active"]
-                        with cir_writer_gate(active_mode) as should_write:
-                            if should_write:
-                                r_taps, i_taps = cqi_to_cir(cqi, calibrator=calibrator, rng=rng)
-                                if active_mode == Mode.SPARSE_TAP:
-                                    r_taps, i_taps = sparsify_topk(r_taps, i_taps, K=4)
-                                try:
-                                    fr.write(" ".join(f"{v:.6f}" for v in r_taps) + "\n")
-                                    fi.write(" ".join(f"{v:.6f}" for v in i_taps) + "\n")
-                                except BrokenPipeError:
-                                    fr, fi = await _reopen_local_fifos(fr, fi)
-                                    continue
+                    now = time.time()
+                    if sync_disable:
+                        pass  # skip
+                    elif min_dt > 0 and (now - _last_write_t[0]) < min_dt:
+                        pass  # throttled
+                    else:
+                        _last_write_t[0] = now
+                        if not _m3_state["restarting"]:
+                            active_mode = _m3_state["active"]
+                            with cir_writer_gate(active_mode) as should_write:
+                                if should_write:
+                                    r_taps, i_taps = cqi_to_cir(cqi, calibrator=calibrator, rng=rng)
+                                    if active_mode == Mode.SPARSE_TAP:
+                                        r_taps, i_taps = sparsify_topk(r_taps, i_taps, K=4)
+                                    try:
+                                        fr.write(" ".join(f"{v:.6f}" for v in r_taps) + "\n")
+                                        fi.write(" ".join(f"{v:.6f}" for v in i_taps) + "\n")
+                                    except BrokenPipeError:
+                                        fr, fi = await _reopen_local_fifos(fr, fi)
+                                        continue
 
                     _log_drift_if_due()
                     now = time.time()
@@ -588,19 +601,26 @@ async def layer1_channel_sync(
                         # M3: gate FIFO write on the *active* mode and skip
                         # entirely while a restart is in flight (remote C side
                         # is down → SSH cat reader is gone, write would block).
-                        if not _m3_state["restarting"]:
-                            active_mode = _m3_state["active"]
-                            with cir_writer_gate(active_mode) as should_write:
-                                if should_write:
-                                    await ensure_pipe(rnti)
-                                    r_taps, i_taps = cqi_to_cir(cqi, calibrator=calibrator, rng=rng)
-                                    if active_mode == Mode.SPARSE_TAP:
-                                        r_taps, i_taps = sparsify_topk(r_taps, i_taps, K=4)
-                                    r_line = " ".join(f"{v:.6f}" for v in r_taps) + "\n"
-                                    i_line = " ".join(f"{v:.6f}" for v in i_taps) + "\n"
-                                    rw, iw = rnti_pipes[rnti]
-                                    rw.write(r_line)
-                                    iw.write(i_line)
+                        now = time.time()
+                        if sync_disable:
+                            pass  # skip
+                        elif min_dt > 0 and (now - _last_write_t[0]) < min_dt:
+                            pass  # throttled
+                        else:
+                            _last_write_t[0] = now
+                            if not _m3_state["restarting"]:
+                                active_mode = _m3_state["active"]
+                                with cir_writer_gate(active_mode) as should_write:
+                                    if should_write:
+                                        await ensure_pipe(rnti)
+                                        r_taps, i_taps = cqi_to_cir(cqi, calibrator=calibrator, rng=rng)
+                                        if active_mode == Mode.SPARSE_TAP:
+                                            r_taps, i_taps = sparsify_topk(r_taps, i_taps, K=4)
+                                        r_line = " ".join(f"{v:.6f}" for v in r_taps) + "\n"
+                                        i_line = " ".join(f"{v:.6f}" for v in i_taps) + "\n"
+                                        rw, iw = rnti_pipes[rnti]
+                                        rw.write(r_line)
+                                        iw.write(i_line)
 
                         _log_drift_if_due()
                         now = time.time()
@@ -806,6 +826,10 @@ def main():
                         help="Wire a CounterfactualOracle into layer2_mac_sync so "
                              "compute_reward(metrics) accumulates as the M2 baseline. "
                              "Required for any evaluate() call to have non-empty baseline.")
+    parser.add_argument("--sync-period-ms", type=float, default=0.0,
+        help="0 = event-driven (default). Otherwise minimum interval between FIFO writes (ms).")
+    parser.add_argument("--sync-disable", action="store_true",
+        help="Disable all CIR/state writes — pure passive monitor.")
     args = parser.parse_args()
 
     rnti = int(args.rnti, 16) if args.rnti else None
@@ -840,6 +864,8 @@ def main():
             args.real_host, args.twin_host, rnti,
             calibrator=calibrator, local_fifo=args.local_fifo,
             drift_log_path=args.drift_log,
+            sync_period_ms=args.sync_period_ms,
+            sync_disable=args.sync_disable,
         ))
     except KeyboardInterrupt:
         print("\nstate_sync stopped.", flush=True)

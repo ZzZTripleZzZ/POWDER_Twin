@@ -9,11 +9,23 @@ message UeMetrics {
     uint32 dl_buffer = 6;
     uint32 ul_buffer = 7;
     float dl_tbs = 8;
+
+    // M4 additions — per-UE MAC state for reconciliation
+    repeated uint32 harq_state = 9;        // 8-slot HARQ buffer codes (0=idle,1=pending,2=NACK)
+    uint32 scheduler_queue_age = 10;       // queue depth × age product
+    uint32 bsr_kbytes = 11;               // last reported buffer status report (kB)
+    bytes  ue_state_hash = 12;            // SHA-256[:16] of (rnti, cqi, harq, bsr, queue_age)
 }
 
 message Metrics {
     uint32 tti_cnt = 1;
     repeated UeMetrics ue_metrics = 2;
+
+    // M4 additions — global sequence and hash for equivalence tracking
+    uint64 tti_seq = 3;                   // monotonic counter since gNB start
+    uint64 wall_clock_us = 4;            // wall-clock µs at metrics publish time
+    bytes  global_state_hash = 5;        // SHA-256[:16] of all UE hashes concatenated
+    uint32 reconcile_epoch = 6;          // increments on each successful reconciliation
 }
 
 
